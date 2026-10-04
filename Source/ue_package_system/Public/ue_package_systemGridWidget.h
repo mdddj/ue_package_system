@@ -339,6 +339,14 @@ public:
     UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Effective Cell Size"))
     float GetEffectiveCellSize() const;
 
+    /** 堆叠角标的字号（像素）：`ScaledFontSize(16, 实际单格边长)`，随 `CellSize` 缩放。 */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Stack Badge Font Size"))
+    int32 GetStackBadgeFontSize() const;
+
+    /** tooltip 的字号（像素）：`ScaledFontSize(16, 实际单格边长)`，随 `CellSize` 缩放。 */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Tooltip Font Size"))
+    int32 GetTooltipFontSize() const;
+
     /** 界面控件（`OwnerScreen`）；`Create Widget` 单独用时为空。 */
     UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Owner Screen"))
     UInvInventoryScreenWidget* GetOwnerScreen() const;

@@ -142,6 +142,14 @@ ue_package_system/
 | `Inv Inventory Screen Widget`（`UInvInventoryScreenWidget`） | 把四个根容器拼成一屏 + 负重条 + 「整理」按钮；同样 `Create Widget` 后设 `Inventory` |
 
 最快的看法：**背包演示 Actor 默认就会建这屏界面**（`bCreateUI = true`）——拖进关卡 Play 即可。
+
+布局（默认 **居中模式**）：**背包是主面板放在屏幕正中**，弹挂 / 安全箱 / 口袋自动排到左 / 右 / 下方
+（哪个存在放哪个；只存在背包时就是纯居中放大）；单格默认 **64 像素**，容器标题 / 堆叠角标 / tooltip /
+负重文本的字号都随格子缩放；每块容器有半透明深色圆角底板 + 描边，标题栏带容器名，主面板标题栏还有
+负重条与「整理」按钮。整屏超过屏幕 85% 时会**等比缩小**（下限 24 像素），分辨率变化后自动重算。
+
+想回到旧布局（左上角起点 + 手动格子大小）：把 `bCenterOnViewport` 勾掉，再调 `Origin` / `CellSize`。
+布局解算也能在蓝图里直接调：`Compute Screen Layout`（纯函数）。
 自己做界面时：
 
 ```

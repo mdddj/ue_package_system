@@ -30,9 +30,12 @@ namespace
     /** 描边厚度（像素）。 */
     constexpr float InvUiBorderThickness = 1.f;
 
-    /** 角标、tooltip 的字号（像素）。 */
-    constexpr int32 InvUiBadgeFontSize = 12;
-    constexpr int32 InvUiTooltipFontSize = 12;
+    /**
+     * 堆叠角标 / tooltip 的**基准**字号：按 64 像素的单格边长设计（实际字号随 `CellSize` 缩放，
+     * 见 `UInvInventoryScreenWidget::ScaledFontSize`），不是写死的像素字号。
+     */
+    constexpr int32 InvUiBadgeFontBase = 16;
+    constexpr int32 InvUiTooltipFontBase = 16;
 
     /** 估算文字宽度用的系数：一个「半角」字符 ≈ 0.6 × 字号。 */
     constexpr float InvUiGlyphWidthFactor = 0.6f;
@@ -1108,6 +1111,17 @@ float UInvGridWidget::GetEffectiveCellSize() const
     return EffectiveCellSize();
 }
 
+int32 UInvGridWidget::GetStackBadgeFontSize() const
+{
+    // 字号的缩放口径只有界面控件那一份（`ScaledFontSize`）：基准按 64 的单格边长设计。
+    return UInvInventoryScreenWidget::ScaledFontSize(InvUiBadgeFontBase, EffectiveCellSize());
+}
+
+int32 UInvGridWidget::GetTooltipFontSize() const
+{
+    return UInvInventoryScreenWidget::ScaledFontSize(InvUiTooltipFontBase, EffectiveCellSize());
+}
+
 FString UInvGridWidget::BuildTooltipText(int64 ItemHandle) const
 {
     FInvItemView View;
@@ -1291,17 +1305,18 @@ void UInvGridWidget::DrawItem(FSlateWindowElementList& OutDrawElements, int32 La
         bSelected ? InvUiSelectionColor.CopyWithNewOpacity(Alpha) : InvUiItemBorderColor.CopyWithNewOpacity(Alpha),
         bSelected ? 2.f : InvUiBorderThickness);
 
-    // 堆叠角标：Stack > 1 才画。
+    // 堆叠角标：Stack > 1 才画（字号随单格边长缩放，不写死像素）。
     if (View.Stack > 1)
     {
+        const int32 BadgeFont = GetStackBadgeFontSize();
         const FString StackText = FString::FromInt(View.Stack);
-        const FVector2D BadgeSize(EstimateTextWidth(StackText, InvUiBadgeFontSize) + 8.f, InvUiBadgeFontSize * 1.5f);
+        const FVector2D BadgeSize(EstimateTextWidth(StackText, BadgeFont) + 8.f, BadgeFont * 1.5f);
         const FVector2D BadgeMin(Min.X + Size.X - BadgeSize.X, Min.Y + Size.Y - BadgeSize.Y);
 
         DrawRect(OutDrawElements, LayerId, Geometry, BadgeMin, BadgeSize,
             InvUiBadgeColor.CopyWithNewOpacity(0.7f * Alpha));
         DrawTextLine(OutDrawElements, LayerId, Geometry, StackText,
-            BadgeMin + BadgeSize * 0.5f, InvUiBadgeFontSize,
+            BadgeMin + BadgeSize * 0.5f, BadgeFont,
             FLinearColor(1.f, 1.f, 1.f, Alpha), FVector2D(0.5f, 0.5f));
     }
 }
@@ -1326,12 +1341,13 @@ void UInvGridWidget::DrawTooltip(FSlateWindowElementList& OutDrawElements, int32
         return;
     }
 
-    // 多行文本按行拆开逐行画：不依赖 Slate 的换行布局，字号 / 行高都由自己定。
-    const float LineHeight = InvUiTooltipFontSize * 1.35f;
+    // 多行文本按行拆开逐行画：不依赖 Slate 的换行布局，字号 / 行高都由自己定（字号随单格边长缩放）。
+    const int32 TooltipFont = GetTooltipFontSize();
+    const float LineHeight = TooltipFont * 1.35f;
     float TextWidth = 0.f;
     for (const FString& Line : Lines)
     {
-        TextWidth = FMath::Max(TextWidth, EstimateTextWidth(Line, InvUiTooltipFontSize));
+        TextWidth = FMath::Max(TextWidth, EstimateTextWidth(Line, TooltipFont));
     }
 
     const FVector2D Padding(8.f, 6.f);
@@ -1345,7 +1361,7 @@ void UInvGridWidget::DrawTooltip(FSlateWindowElementList& OutDrawElements, int32
     {
         const FVector2D LinePos(BoxMin.X + Padding.X, BoxMin.Y + Padding.Y + Index * LineHeight);
         // 首行是物品名，用亮色；其余信息用次级色。
-        DrawTextLine(OutDrawElements, LayerId, Geometry, Lines[Index], LinePos, InvUiTooltipFontSize,
+        DrawTextLine(OutDrawElements, LayerId, Geometry, Lines[Index], LinePos, TooltipFont,
             Index == 0 ? InvUiTextColor : InvUiSubTextColor);
     }
 }
@@ -1372,7 +1388,7 @@ int32 UInvGridWidget::NativePaint(const FPaintArgs& Args, const FGeometry& Allot
         DrawBorder(OutDrawElements, FirstLayer, AllottedGeometry, FVector2D::ZeroVector, BoxSize,
             InvUiInvalidColor, 2.f);
         DrawTextLine(OutDrawElements, FirstLayer + 1, AllottedGeometry,
-            TEXT("容器 / 子网格无效"), FVector2D(6.f, 6.f), InvUiTooltipFontSize, InvUiInvalidColor);
+            TEXT("容器 / 子网格无效"), FVector2D(6.f, 6.f), GetTooltipFontSize(), InvUiInvalidColor);
         return FirstLayer + 2;
     }
 

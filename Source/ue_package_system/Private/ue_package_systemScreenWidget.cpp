@@ -2,13 +2,16 @@
 
 #include "Application/SlateApplicationBase.h"
 #include "Blueprint/WidgetTree.h"
+#include "Brushes/SlateRoundedBoxBrush.h"
 #include "Components/Border.h"
 #include "Components/Button.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
+#include "Components/Image.h"
 #include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
+#include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
 #include "Styling/CoreStyle.h"
@@ -36,6 +39,108 @@ namespace
 
     /** 标题距离负重条上方的距离（像素）。 */
     constexpr float InvUiScreenTitleGap = 6.f;
+
+    /** 参考内容：默认背包根容器（6×5 格）——`ComputeScreenLayout` 不知道实例内容时按它算整屏尺寸。 */
+    constexpr int32 InvUiScreenReferenceCellsX = 6;
+    constexpr int32 InvUiScreenReferenceCellsY = 5;
+
+    /** 布局参数的默认值（属性配成非法值时退回它们，与头文件里的默认值保持一致）。 */
+    constexpr float InvUiScreenDefaultDesiredCellSize = 64.f;
+    constexpr float InvUiScreenDefaultMaxScreenFraction = 0.85f;
+    constexpr float InvUiScreenDefaultMinCellSize = 24.f;
+
+    /** 字号下限：缩放后的字号不低于 10 像素，容器标题不低于 14 像素（再小就看不清了）。 */
+    constexpr int32 InvUiScreenMinFontSize = 10;
+    constexpr int32 InvUiScreenMinTitleFontSize = 14;
+
+    /** 面板内边距基准（像素，按单格边长缩放）。 */
+    constexpr float InvUiScreenPanelPaddingBase = 8.f;
+
+    /** 面板底板 / 标题栏 / 描边的配色与描边宽度（零资产：纯色 + 圆角，不依赖任何贴图）。 */
+    const FLinearColor InvUiScreenPanelColor(0.05f, 0.06f, 0.09f, 1.f);   // alpha 由 BackgroundOpacity 给
+    const FLinearColor InvUiScreenPanelOutline(0.34f, 0.40f, 0.50f, 1.f);
+    const FLinearColor InvUiScreenTitleBarColor(1.f, 1.f, 1.f, 0.07f);    // 标题栏比面板略亮一点
+    constexpr float InvUiScreenPanelOutlineWidth = 1.f;
+
+    /** 面板控件的画布层级：底板 / 标题栏压在最下面（子控件与子格子默认层 = 0，会盖在它们上面）。 */
+    constexpr int32 InvUiScreenPanelZOrder = -200;
+
+    /** 主面板标题栏里负重条的宽度占比与上下限（像素）。 */
+    constexpr float InvUiScreenWeightBarWidthRatio = 0.42f;
+    constexpr float InvUiScreenWeightBarMinWidth = 160.f;
+    constexpr float InvUiScreenWeightBarMaxWidth = 360.f;
+
+    /** 标题栏 / 小标题 / 按钮挨着内容留的空隙（像素）。 */
+    constexpr float InvUiScreenTitleBarBottomPadding = 8.f;
+
+    /** 「整理」按钮高度基准与宽高比（基准 88×22 出现在 64 的单格边长下）。 */
+    constexpr float InvUiScreenSortButtonHeightBase = 22.f;
+    constexpr float InvUiScreenSortButtonMinHeight = 20.f;
+    constexpr float InvUiScreenSortButtonAspect = 4.f;
+
+    /** 缩放基准：所有像素尺寸 / 字号都按这个单格边长设计。 */
+    float InvUiScreenScaled(const float Base, const float InCellSize)
+    {
+        const float Cell = InCellSize > 0.f ? InCellSize : InvUiScreenDefaultDesiredCellSize;
+        return Base * Cell / InvUiScreenDefaultDesiredCellSize;
+    }
+
+    /**
+     * 自适应缩放的解算核心（纯函数 `ComputeScreenLayout` 与实例共用）：
+     * 每轴可用边长 = `(可用尺寸 - 固定部分) / 每格尺寸`，取两轴较小值，再夹到下限（**下限优先**）。
+     */
+    float InvUiScreenFittedCellSize(const FVector2D& FitSize, const FVector2D& GridUnits,
+        const FVector2D& Chrome, const float DesiredCellSize, const float MinCellSize)
+    {
+        const float UnitsX = FMath::Max(GridUnits.X, KINDA_SMALL_NUMBER);
+        const float UnitsY = FMath::Max(GridUnits.Y, KINDA_SMALL_NUMBER);
+        const float FitX = (FitSize.X - Chrome.X) / UnitsX;
+        const float FitY = (FitSize.Y - Chrome.Y) / UnitsY;
+        return FMath::Max(FMath::Min3(DesiredCellSize, FitX, FitY), MinCellSize);
+    }
+
+    /** 容器面板的标题栏高度：属性值按单格边长缩放，同时保证放得下标题字号与内容（主面板是负重条）。 */
+    float InvUiScreenTitleBarHeight(const float BaseHeight, const float InCellSize, const int32 TitleFont,
+        const float ContentsHeight)
+    {
+        return FMath::Max3(InvUiScreenScaled(BaseHeight, InCellSize), (float)TitleFont + 8.f, ContentsHeight);
+    }
+
+    /** 子格子小标题的行高（跟着字号走；基准字号 16 与 `LabelFontBase` 一致）。 */
+    float InvUiScreenCaptionHeight(const float InCellSize)
+    {
+        return (float)UInvInventoryScreenWidget::ScaledFontSize(16, InCellSize) + 6.f;
+    }
+
+    /** 负重条高度（按单格边长缩放，保证装得下条上的文本）。 */
+    float InvUiScreenWeightBarHeight(const float InCellSize)
+    {
+        return FMath::Max(InvUiScreenScaled(InvUiScreenBarHeight, InCellSize), 18.f);
+    }
+
+    /** 「整理」按钮尺寸（按单格边长缩放；64 的单格边长下是 88×22，与老常量一致）。 */
+    FVector2D InvUiScreenSortButtonSize(const float InCellSize)
+    {
+        const float Height = FMath::Max(InvUiScreenScaled(InvUiScreenSortButtonHeightBase, InCellSize),
+            InvUiScreenSortButtonMinHeight);
+        return FVector2D(Height * InvUiScreenSortButtonAspect, Height);
+    }
+
+    /** 主面板标题栏里负重条的宽度（面板宽的一部分，夹到上下限）。 */
+    float InvUiScreenWeightBarWidth(const float PanelWidth)
+    {
+        return FMath::Clamp(PanelWidth * InvUiScreenWeightBarWidthRatio,
+            InvUiScreenWeightBarMinWidth, InvUiScreenWeightBarMaxWidth);
+    }
+
+    /**
+     * 零资产圆角笔刷：纯色填充 + 1px 描边，Slate 渲染时现画（不需要任何贴图资产）。
+     * `FSlateRoundedBoxBrush` 只比 `FSlateBrush` 多几个构造函数，切回基类不丢数据。
+     */
+    FSlateBrush InvUiScreenRoundedBrush(const FLinearColor& Fill, const FLinearColor& Outline, const float Radius)
+    {
+        return FSlateRoundedBoxBrush(Fill, Radius, Outline, InvUiScreenPanelOutlineWidth);
+    }
 
     /** 右键菜单：底板配色 / 内边距（像素）/ 上下留白。 */
     const FLinearColor InvUiScreenMenuColor(0.06f, 0.07f, 0.10f, 0.96f);
@@ -192,17 +297,17 @@ void UInvInventoryScreenWidget::BuildStaticContent()
         return;
     }
 
-    const float BarWidth = FMath::Max(MinPanelWidth - SortButtonWidth - 8.f, 80.f);
+    // 字号都按当前单格边长算（构造这一刻拿不到自适应结果，`ApplyLayout` 里会再按实际尺寸刷一遍）。
+    const float Cell = FontCellSize();
+    const int32 LabelFont = ScaledFontSize(LabelFontBase, Cell);
 
     // 顶部说明：告诉用户能干什么（无资产，纯文本）。
     TitleLabel = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("ScreenTitle"));
     if (TitleLabel)
     {
-        TitleLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", TitleFontSize));
+        TitleLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
         TitleLabel->SetColorAndOpacity(FSlateColor(FLinearColor(0.90f, 0.93f, 1.f, 1.f)));
         TitleLabel->SetText(FText::FromString(TEXT("背包（拖拽移动 / R 旋转 / Esc 取消）")));
-        PlaceInCanvas(TitleLabel, FVector2D(Origin.X, Origin.Y - TitleFontSize - InvUiScreenTitleGap),
-            FVector2D(MinPanelWidth, TitleFontSize + 4.f));
     }
 
     // 负重条 + 条上的文本：条画在下面，文本压在同一条上。
@@ -211,16 +316,14 @@ void UInvInventoryScreenWidget::BuildStaticContent()
     {
         WeightBar->SetPercent(0.f);
         WeightBar->SetFillColorAndOpacity(InvUiScreenFillNormal);
-        PlaceInCanvas(WeightBar, Origin, FVector2D(BarWidth, InvUiScreenBarHeight));
     }
 
     WeightLabel = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("WeightLabel"));
     if (WeightLabel)
     {
-        WeightLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFontSize));
+        WeightLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
         WeightLabel->SetColorAndOpacity(FSlateColor(FLinearColor(1.f, 1.f, 1.f, 1.f)));
         WeightLabel->SetText(FText::FromString(GetWeightText()));
-        PlaceInCanvas(WeightLabel, Origin + FVector2D(6.f, 2.f), FVector2D(BarWidth - 12.f, InvUiScreenBarHeight - 4.f));
     }
 
     // 「整理」按钮：UButton + 里面的 UTextBlock，样式走引擎默认（零资产）。
@@ -229,17 +332,18 @@ void UInvInventoryScreenWidget::BuildStaticContent()
     {
         SortButton->OnClicked.AddDynamic(this, &UInvInventoryScreenWidget::OnSortClicked);
 
-        UTextBlock* ButtonLabel = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("SortButtonLabel"));
-        if (ButtonLabel)
+        SortButtonLabel = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("SortButtonLabel"));
+        if (SortButtonLabel)
         {
-            ButtonLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFontSize));
-            ButtonLabel->SetText(FText::FromString(TEXT("整理")));
-            SortButton->AddChild(ButtonLabel);
+            SortButtonLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
+            SortButtonLabel->SetText(FText::FromString(TEXT("整理")));
+            SortButton->AddChild(SortButtonLabel);
         }
-
-        PlaceInCanvas(SortButton, FVector2D(Origin.X + MinPanelWidth - SortButtonWidth, Origin.Y),
-            FVector2D(SortButtonWidth, InvUiScreenBarHeight));
     }
+
+    // 先按旧口径摆一次（`Origin` 起）：居中模式随后的 `ApplyLayout` 会按面板重排，
+    // 而只调 `EnsureContentBuilt`（比如开右键菜单）的路径下也有个像样的位置。
+    LayoutHeaderAtOrigin(Cell);
 
     // 右键菜单（底板 + 按钮）最后建：它会盖在格子上层，初始收起来。
     BuildContextMenu();
@@ -283,7 +387,7 @@ void UInvInventoryScreenWidget::BuildContextMenu()
                 *FString::Printf(TEXT("ContextMenuLabel%d"), Index));
             if (Label)
             {
-                Label->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFontSize));
+                Label->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", ScaledFontSize(LabelFontBase, FontCellSize())));
                 Label->SetText(FText::FromString(InvUiScreenActionText(Action)));
                 Button->AddChild(Label);
             }
@@ -322,7 +426,8 @@ void UInvInventoryScreenWidget::BuildContextMenu()
     PlaceInCanvas(ContextMenuBorder, Origin, FVector2D(ContextMenuWidth, ContextMenuButtonHeight));
 }
 
-void UInvInventoryScreenWidget::PlaceInCanvas(UWidget* Widget, const FVector2D& Position, const FVector2D& Size)
+void UInvInventoryScreenWidget::PlaceInCanvas(UWidget* Widget, const FVector2D& Position, const FVector2D& Size,
+    int32 ZOrder)
 {
     if (!RootCanvas || !Widget)
     {
@@ -341,6 +446,7 @@ void UInvInventoryScreenWidget::PlaceInCanvas(UWidget* Widget, const FVector2D& 
     }
 
     CanvasSlot->SetAutoSize(false);
+    CanvasSlot->SetZOrder(ZOrder);
     CanvasSlot->SetPosition(Position);
     CanvasSlot->SetSize(Size);
 }
@@ -368,7 +474,7 @@ UInvGridWidget* UInvInventoryScreenWidget::CreateGridWidget(int64 InContainer, i
     Grid->Inventory = Inventory;
     Grid->Container = InContainer;
     Grid->Part = InPart;
-    Grid->CellSize = CellSize;
+    Grid->CellSize = EffectiveCellSize;   // 自适应之后的实际单格边长（没算过时它是 0，格子自己会兜底）
     Grid->OwnerScreen = this;
 
     PlaceInCanvas(Grid, FVector2D(Origin.X, Origin.Y + InvUiScreenBarHeight + 14.f), FVector2D(1.f, 1.f));
@@ -378,7 +484,7 @@ UInvGridWidget* UInvInventoryScreenWidget::CreateGridWidget(int64 InContainer, i
         *FString::Printf(TEXT("GridCaption_%lld_%d"), InContainer, InPart));
     if (Caption)
     {
-        Caption->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFontSize));
+        Caption->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", ScaledFontSize(LabelFontBase, FontCellSize())));
         Caption->SetColorAndOpacity(FSlateColor(FLinearColor(0.82f, 0.85f, 0.90f, 1.f)));
         PlaceInCanvas(Caption, FVector2D(Origin.X, Origin.Y + InvUiScreenBarHeight + 14.f),
             FVector2D(MinPanelWidth, CaptionHeight));
@@ -459,7 +565,7 @@ bool UInvInventoryScreenWidget::SyncGridWidgets(const TArray<FInvGridSlotKey>& D
             if (Grid)
             {
                 Grid->Inventory = Inventory;
-                Grid->CellSize = CellSize;
+                Grid->CellSize = EffectiveCellSize;   // 自适应之后的实际值（0 时格子自己回退默认）
                 Grid->Refresh();
             }
         }
@@ -496,7 +602,7 @@ bool UInvInventoryScreenWidget::SyncGridWidgets(const TArray<FInvGridSlotKey>& D
 
             Grid->SetVisibility(ESlateVisibility::Visible);
             Grid->Inventory = Inventory;
-            Grid->CellSize = CellSize;
+            Grid->CellSize = EffectiveCellSize;   // 自适应之后的实际值（0 时格子自己回退默认）
             if (Caption)
             {
                 Caption->SetVisibility(ESlateVisibility::Visible);
@@ -625,25 +731,757 @@ void UInvInventoryScreenWidget::UpdateWeightDisplay()
     }
 }
 
+// ==================== 布局：纯函数 ====================
+
+int32 UInvInventoryScreenWidget::ScaledFontSize(int32 BaseFontSize, float InCellSize)
+{
+    const float Cell = InCellSize > 0.f ? InCellSize : InvUiScreenDefaultDesiredCellSize;
+    const float Scale = Cell / InvUiScreenDefaultDesiredCellSize;
+    return FMath::Max(FMath::RoundToInt(BaseFontSize * Scale), InvUiScreenMinFontSize);
+}
+
+int32 UInvInventoryScreenWidget::TitleFontSize(float InCellSize)
+{
+    const float Cell = InCellSize > 0.f ? InCellSize : InvUiScreenDefaultDesiredCellSize;
+    return FMath::Max(FMath::RoundToInt(Cell * 0.4f), InvUiScreenMinTitleFontSize);
+}
+
+FInvScreenLayout UInvInventoryScreenWidget::ComputeScreenLayout(FVector2D ViewportSize, float InDesiredCellSize,
+    float InMaxScreenFraction, float InMinCellSize, FVector2D InPanelSpacing)
+{
+    FInvScreenLayout Layout;
+
+    // 参数兜底：非法值一律退回默认，保证结果恒为正、可预期。
+    const float MinCell = InMinCellSize > 0.f ? InMinCellSize : InvUiScreenDefaultMinCellSize;
+    const float Fraction = InMaxScreenFraction > 0.f
+        ? FMath::Min(InMaxScreenFraction, 1.f)
+        : InvUiScreenDefaultMaxScreenFraction;
+    const float Desired = InDesiredCellSize > 0.f ? InDesiredCellSize : MinCell;
+    const FVector2D Spacing(FMath::Max(InPanelSpacing.X, 0.f), FMath::Max(InPanelSpacing.Y, 0.f));
+    const FVector2D Viewport(FMath::Max(ViewportSize.X, 0.f), FMath::Max(ViewportSize.Y, 0.f));
+
+    // 参考内容 = 默认背包 6×5 格；固定部分 = 面板四周留白（两倍 PanelSpacing）——实例走同一套规则。
+    const FVector2D Cells(InvUiScreenReferenceCellsX, InvUiScreenReferenceCellsY);
+    const FVector2D Chrome = Spacing * 2.f;
+
+    Layout.CellSize = InvUiScreenFittedCellSize(Viewport * Fraction, Cells, Chrome, Desired, MinCell);
+    Layout.TotalSize = Cells * Layout.CellSize + Chrome;
+    Layout.PanelOrigin = (Viewport - Layout.TotalSize) * 0.5f;
+    return Layout;
+}
+
+TArray<UImage*> UInvInventoryScreenWidget::GetPanelBoards() const
+{
+    TArray<UImage*> Result;
+    Result.Reserve(PanelBoards.Num());
+    for (const TObjectPtr<UImage>& Board : PanelBoards)
+    {
+        Result.Add(Board.Get());
+    }
+    return Result;
+}
+
+TArray<int64> UInvInventoryScreenWidget::GetPanelContainers() const
+{
+    return PanelContainers;
+}
+
+// ==================== 布局：实例 ====================
+
+float UInvInventoryScreenWidget::ManualCellSize() const
+{
+    return CellSize > 0.f ? CellSize : DesiredCellSize;
+}
+
+float UInvInventoryScreenWidget::FontCellSize() const
+{
+    return EffectiveCellSize > 0.f ? EffectiveCellSize : ManualCellSize();
+}
+
+FVector2D UInvInventoryScreenWidget::EffectivePanelSpacing() const
+{
+    return FVector2D(FMath::Max(PanelSpacing.X, 0.f), FMath::Max(PanelSpacing.Y, 0.f));
+}
+
+float UInvInventoryScreenWidget::EffectiveMaxScreenFraction() const
+{
+    return MaxScreenFraction > 0.f ? FMath::Min(MaxScreenFraction, 1.f) : InvUiScreenDefaultMaxScreenFraction;
+}
+
+float UInvInventoryScreenWidget::EffectiveMinCellSize() const
+{
+    return MinCellSize > 0.f ? MinCellSize : InvUiScreenDefaultMinCellSize;
+}
+
+FVector2D UInvInventoryScreenWidget::ResolveViewportSize() const
+{
+    // 优先用本控件自己的几何：它就是「整屏」的实际尺寸（Slate 单位，与子控件坐标同一套）。
+    const FVector2D LocalSize = GetCachedGeometry().GetLocalSize();
+    if (LocalSize.X > 0.f && LocalSize.Y > 0.f)
+    {
+        return LocalSize;
+    }
+
+    // 几何还没算出来：只有在真的上屏了（Slate 控件已经构造出来）时才相信游戏 viewport 的像素尺寸。
+    // 无头命令集 / 专用服务器里没有 Slate：尺寸按「未知」处理，布局退回确定性口径（不居中、不缩放）。
+    if (!GetCachedWidget().IsValid())
+    {
+        return FVector2D::ZeroVector;
+    }
+
+    if (const UWorld* World = GetWorld())
+    {
+        if (const UGameViewportClient* GameViewport = World->GetGameViewport())
+        {
+            if (GameViewport->Viewport)
+            {
+                const FIntPoint Size = GameViewport->Viewport->GetSizeXY();
+                return FVector2D(Size.X, Size.Y);
+            }
+        }
+    }
+    return FVector2D::ZeroVector;
+}
+
+void UInvInventoryScreenWidget::UpdateEffectiveCellSize()
+{
+    const float Manual = ManualCellSize();
+
+    if (!bCenterOnViewport)
+    {
+        EffectiveCellSize = Manual;   // 兼容模式：手动值原样用，不缩放
+        return;
+    }
+
+    const FVector2D Viewport = ResolveViewportSize();
+    if (!Inventory || Viewport.X <= 0.f || Viewport.Y <= 0.f)
+    {
+        // 没数据 / 拿不到 viewport 尺寸（没上屏 / 无头命令集 / 专用服务器）：不缩放，按手动值走。
+        EffectiveCellSize = Manual;
+        return;
+    }
+
+    // 两档实测分离「固定部分」与「每格尺寸」：面板尺寸 = 固定部分 + 格数 × 单格边长，
+    // 所以 S(1) 与 S(2) 两个采样就能解出这两项（不靠把内边距 / 标题栏高度拼成常数）。
+    const FVector2D Spacing = EffectivePanelSpacing();
+    const FVector2D OneCell = MeasureClusterSize(1.f);
+    const FVector2D TwoCells = MeasureClusterSize(2.f);
+    const FVector2D GridUnits(FMath::Max(TwoCells.X - OneCell.X, 0.f), FMath::Max(TwoCells.Y - OneCell.Y, 0.f));
+    const FVector2D Chrome = OneCell * 2.f - TwoCells + Spacing * 2.f;
+
+    const float FitX = Viewport.X * EffectiveMaxScreenFraction();
+    const float FitY = Viewport.Y * EffectiveMaxScreenFraction();
+    const float MinCell = EffectiveMinCellSize();
+    const float Desired = DesiredCellSize > 0.f ? DesiredCellSize : Manual;
+
+    float Cell = InvUiScreenFittedCellSize(FVector2D(FitX, FitY), GridUnits, Chrome, Desired, MinCell);
+
+    // 字号 / 标题栏高度是四舍五入的，实测可能比线性估计大一点点：超了按比例再缩（最多 3 轮）。
+    for (int32 Pass = 0; Pass < 3 && Cell > MinCell; ++Pass)
+    {
+        const FVector2D Total = MeasureClusterSize(Cell) + Spacing * 2.f;
+        if (Total.X <= FitX + 0.5f && Total.Y <= FitY + 0.5f)
+        {
+            break;
+        }
+        const float Scale = FMath::Min(FitX / FMath::Max(Total.X, 1.f), FitY / FMath::Max(Total.Y, 1.f));
+        Cell = FMath::Max(MinCell, Cell * Scale * 0.995f);
+    }
+
+    if (!FMath::IsNearlyEqual(Cell, EffectiveCellSize))
+    {
+        UE_LOG(LogTemp, Log,
+            TEXT("背包界面: 界面 %s 自适应单格边长 %.1f → %.1f（viewport %.0fx%.0f / 上限比例 %.2f / 下限 %.1f）"),
+            *GetName(), EffectiveCellSize, Cell, Viewport.X, Viewport.Y, EffectiveMaxScreenFraction(), MinCell);
+    }
+    EffectiveCellSize = Cell;
+}
+
+void UInvInventoryScreenWidget::CollectGridsOfContainer(int64 InContainer, TArray<UInvGridWidget*>& OutGrids) const
+{
+    OutGrids.Reset();
+    for (const TObjectPtr<UInvGridWidget>& Grid : GridWidgets)
+    {
+        if (Grid && Grid->GetVisibility() == ESlateVisibility::Visible && Grid->Container == InContainer)
+        {
+            OutGrids.Add(Grid);
+        }
+    }
+}
+
+void UInvInventoryScreenWidget::BuildPanelRects(float InCellSize, TArray<FInvScreenPanelRect>& OutPanels) const
+{
+    OutPanels.Reset();
+    if (!Inventory)
+    {
+        return;
+    }
+
+    const float Cell = FMath::Max(InCellSize, 0.f);
+    const FVector2D Spacing = EffectivePanelSpacing();
+    const float Padding = InvUiScreenScaled(InvUiScreenPanelPaddingBase, Cell);
+    const float CaptionH = InvUiScreenCaptionHeight(Cell);
+
+    /** 面板 + 它里面子格子区域的总尺寸（`GridsSize` 是排布用的外框，不是格子本身的和）。 */
+    struct FLocalPanelSpec
+    {
+        int64 Container = 0;
+        EInvScreenPanelSlot Slot = EInvScreenPanelSlot::Extra;
+        FVector2D GridsSize = FVector2D::ZeroVector;
+        FVector2D Size = FVector2D::ZeroVector;
+        FVector2D Position = FVector2D::ZeroVector;
+    };
+
+    // 1) `ShowTypes` 里存在的根容器（顺序确定，与子格子的收集口径一致）。
+    TArray<int64> Containers;
+    TSet<EInvContainerType> Handled;
+    for (const EInvContainerType Type : ShowTypes)
+    {
+        if (Type == EInvContainerType::Nested || Handled.Contains(Type))
+        {
+            continue;
+        }
+        Handled.Add(Type);
+
+        const int64 Container = Inventory->GetContainer(Type);
+        if (Container > 0)
+        {
+            Containers.Add(Container);
+        }
+    }
+
+    // 2) 槽位：主面板 = 背包（显示里没有背包时退到第一个存在的容器），其余按类型贴上去。
+    const int64 Backpack = Inventory->GetContainer(EInvContainerType::Backpack);
+    const int64 MainContainer = Containers.Contains(Backpack)
+        ? Backpack
+        : (Containers.Num() > 0 ? Containers[0] : 0);
+
+    TArray<FLocalPanelSpec> Specs;
+    TSet<int64> Added;
+    const auto AddPanel = [&](const int64 Container, const EInvScreenPanelSlot Slot)
+    {
+        if (Container <= 0 || Added.Contains(Container))
+        {
+            return;
+        }
+
+        const TArray<FIntPoint> Parts = Inventory->GetContainerParts(Container);
+        if (Parts.Num() <= 0)
+        {
+            return;   // 容器还在但一块子网格都没有（理论上不会）：不画面板
+        }
+
+        FLocalPanelSpec Spec;
+        Spec.Container = Container;
+        Spec.Slot = Slot;
+        for (int32 Part = 0; Part < Parts.Num(); ++Part)
+        {
+            const FVector2D PartSize(Parts[Part].X * Cell, Parts[Part].Y * Cell);
+            Spec.GridsSize.X += PartSize.X + (Part > 0 ? InvUiScreenGridSpacing : 0.f);
+            Spec.GridsSize.Y = FMath::Max(Spec.GridsSize.Y, PartSize.Y);
+        }
+
+        Added.Add(Container);
+        Specs.Add(Spec);
+    };
+
+    AddPanel(MainContainer, EInvScreenPanelSlot::Main);
+    AddPanel(Inventory->GetContainer(EInvContainerType::ChestRig), EInvScreenPanelSlot::Left);
+    AddPanel(Inventory->GetContainer(EInvContainerType::SafeBox), EInvScreenPanelSlot::Right);
+    AddPanel(Inventory->GetContainer(EInvContainerType::Pockets), EInvScreenPanelSlot::Bottom);
+    for (const int64 Container : Containers)
+    {
+        AddPanel(Container, EInvScreenPanelSlot::Extra);   // 认不出槽位的容器继续往下堆
+    }
+
+    // 3) 面板尺寸：内边距 + 标题栏 + 小标题行 + 子格子区域（主面板多一条放「整理」按钮的底边）。
+    for (FLocalPanelSpec& Spec : Specs)
+    {
+        const bool bMain = Spec.Slot == EInvScreenPanelSlot::Main;
+        const float TitleContents = bMain
+            ? InvUiScreenWeightBarHeight(Cell) + InvUiScreenTitleBarBottomPadding
+            : 0.f;
+        const float TitleBarH = InvUiScreenTitleBarHeight(TitleHeight, Cell, TitleFontSize(Cell), TitleContents);
+        const float FooterH = bMain
+            ? InvUiScreenSortButtonSize(Cell).Y + InvUiScreenTitleBarBottomPadding
+            : 0.f;
+
+        Spec.Size = FVector2D(
+            Padding * 2.f + Spec.GridsSize.X,
+            Padding * 2.f + TitleBarH + CaptionH + Spec.GridsSize.Y + FooterH);
+    }
+
+    // 4) 相对位置：主面板中心 = 原点，其余贴上去（左 / 右竖直居中于主面板，下方一行居中）。
+    const FLocalPanelSpec* Main = Specs.FindByPredicate([](const FLocalPanelSpec& Spec)
+    {
+        return Spec.Slot == EInvScreenPanelSlot::Main;
+    });
+    if (!Main)
+    {
+        return;   // 一块主面板都没有（没有任何根容器）：调用方按「没有面板」处理
+    }
+    const FVector2D MainSize = Main->Size;
+
+    float LeftCursor = 0.f;
+    float RightCursor = 0.f;
+    float BottomCursor = 0.f;
+    float ExtraCursor = 0.f;
+    for (FLocalPanelSpec& Spec : Specs)
+    {
+        switch (Spec.Slot)
+        {
+        case EInvScreenPanelSlot::Main:
+            Spec.Position = -Spec.Size * 0.5f;
+            break;
+
+        case EInvScreenPanelSlot::Left:
+            Spec.Position = FVector2D(
+                -(MainSize.X * 0.5f + Spacing.X + Spec.Size.X),
+                LeftCursor - Spec.Size.Y * 0.5f);
+            LeftCursor += Spec.Size.Y + Spacing.Y;
+            break;
+
+        case EInvScreenPanelSlot::Right:
+            Spec.Position = FVector2D(
+                MainSize.X * 0.5f + Spacing.X,
+                RightCursor - Spec.Size.Y * 0.5f);
+            RightCursor += Spec.Size.Y + Spacing.Y;
+            break;
+
+        case EInvScreenPanelSlot::Bottom:
+            Spec.Position = FVector2D(
+                BottomCursor - Spec.Size.X * 0.5f,
+                MainSize.Y * 0.5f + Spacing.Y);
+            BottomCursor += Spec.Size.X + Spacing.X;
+            break;
+
+        default:
+            Spec.Position = FVector2D(
+                -Spec.Size.X * 0.5f,
+                MainSize.Y * 0.5f + Spacing.Y + ExtraCursor);
+            ExtraCursor += Spec.Size.Y + Spacing.Y;
+            break;
+        }
+    }
+
+    OutPanels.Reserve(Specs.Num());
+    for (const FLocalPanelSpec& Spec : Specs)
+    {
+        FInvScreenPanelRect Rect;
+        Rect.Container = Spec.Container;
+        Rect.Slot = Spec.Slot;
+        Rect.Size = Spec.Size;
+        Rect.Position = Spec.Position;
+        OutPanels.Add(Rect);
+    }
+}
+
+FVector2D UInvInventoryScreenWidget::MeasureClusterSize(float InCellSize) const
+{
+    TArray<FInvScreenPanelRect> Panels;
+    BuildPanelRects(InCellSize, Panels);
+
+    // 主面板中心 = 原点：簇按它对称展开，所以主面板一定落在整屏正中间（左右面板宽度不同也不跑偏）。
+    FVector2D Half = FVector2D::ZeroVector;
+    for (const FInvScreenPanelRect& Panel : Panels)
+    {
+        Half.X = FMath::Max(Half.X, FMath::Max(-Panel.Position.X, Panel.Position.X + Panel.Size.X));
+        Half.Y = FMath::Max(Half.Y, FMath::Max(-Panel.Position.Y, Panel.Position.Y + Panel.Size.Y));
+    }
+    return Half * 2.f;
+}
+
+void UInvInventoryScreenWidget::SyncPanelDecor(int32 Needed)
+{
+    if (!WidgetTree || !RootCanvas)
+    {
+        return;
+    }
+
+    // 缺的补：底板（圆角 + 描边）/ 标题栏底条 / 标题文本，三块一组，下标 = 面板下标。
+    while (PanelBoards.Num() < Needed)
+    {
+        const int32 Index = PanelBoards.Num();
+        const float Radius = InvUiScreenScaled(PanelCornerRadiusBase, FontCellSize());
+
+        UImage* Board = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(),
+            *FString::Printf(TEXT("PanelBoard%d"), Index));
+        if (Board)
+        {
+            Board->SetBrush(InvUiScreenRoundedBrush(
+                FLinearColor(InvUiScreenPanelColor.R, InvUiScreenPanelColor.G, InvUiScreenPanelColor.B,
+                    FMath::Clamp(BackgroundOpacity, 0.f, 1.f)),
+                InvUiScreenPanelOutline, Radius));
+            Board->SetVisibility(ESlateVisibility::Collapsed);
+            PlaceInCanvas(Board, FVector2D::ZeroVector, FVector2D::ZeroVector, InvUiScreenPanelZOrder + Index * 2);
+        }
+
+        UImage* TitleBar = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(),
+            *FString::Printf(TEXT("PanelTitleBar%d"), Index));
+        if (TitleBar)
+        {
+            TitleBar->SetBrush(InvUiScreenRoundedBrush(InvUiScreenTitleBarColor, FLinearColor::Transparent, Radius));
+            TitleBar->SetVisibility(ESlateVisibility::Collapsed);
+            PlaceInCanvas(TitleBar, FVector2D::ZeroVector, FVector2D::ZeroVector, InvUiScreenPanelZOrder + Index * 2 + 1);
+        }
+
+        UTextBlock* Title = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(),
+            *FString::Printf(TEXT("PanelTitle%d"), Index));
+        if (Title)
+        {
+            Title->SetColorAndOpacity(FSlateColor(FLinearColor(0.92f, 0.95f, 1.f, 1.f)));
+            Title->SetVisibility(ESlateVisibility::Collapsed);
+            PlaceInCanvas(Title, FVector2D::ZeroVector, FVector2D::ZeroVector);
+        }
+
+        PanelBoards.Add(Board);
+        PanelTitleBars.Add(TitleBar);
+        PanelTitles.Add(Title);
+    }
+
+    // 多的收起来（不销毁：它可能正处在鼠标事件处理里；成员数组保持与 `PanelContainers` 同长）。
+    for (int32 Index = Needed; Index < PanelBoards.Num(); ++Index)
+    {
+        if (PanelBoards[Index])
+        {
+            PanelBoards[Index]->SetVisibility(ESlateVisibility::Collapsed);
+        }
+        if (PanelTitleBars[Index])
+        {
+            PanelTitleBars[Index]->SetVisibility(ESlateVisibility::Collapsed);
+        }
+        if (PanelTitles[Index])
+        {
+            PanelTitles[Index]->SetVisibility(ESlateVisibility::Collapsed);
+        }
+    }
+
+    PanelContainers.SetNum(FMath::Max(Needed, 0));
+    if (Needed <= 0)
+    {
+        PanelContainers.Reset();
+    }
+}
+
+void UInvInventoryScreenWidget::SetPanelDecorVisible(bool bVisible)
+{
+    const ESlateVisibility Visibility = bVisible ? ESlateVisibility::Visible : ESlateVisibility::Collapsed;
+    for (int32 Index = 0; Index < PanelBoards.Num(); ++Index)
+    {
+        const bool bShown = bVisible && PanelContainers.IsValidIndex(Index) && PanelContainers[Index] > 0;
+        if (PanelBoards[Index])
+        {
+            PanelBoards[Index]->SetVisibility(bShown ? Visibility : ESlateVisibility::Collapsed);
+        }
+        if (PanelTitleBars[Index])
+        {
+            PanelTitleBars[Index]->SetVisibility(bShown ? Visibility : ESlateVisibility::Collapsed);
+        }
+        if (PanelTitles[Index])
+        {
+            PanelTitles[Index]->SetVisibility(bShown ? Visibility : ESlateVisibility::Collapsed);
+        }
+    }
+}
+
+void UInvInventoryScreenWidget::ApplyFonts(float InCellSize)
+{
+    // 小字号文本（提示 / 负重 / 按钮 / 菜单 / 子格子小标题）共用一套基准；面板标题走 `CellSize × 0.4`。
+    const int32 LabelFont = ScaledFontSize(LabelFontBase, InCellSize);
+    const int32 PanelFont = TitleFontSize(InCellSize);
+
+    if (TitleLabel)
+    {
+        TitleLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
+    }
+    if (WeightLabel)
+    {
+        WeightLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
+    }
+    if (SortButtonLabel)
+    {
+        SortButtonLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
+    }
+
+    // 右键菜单按钮里的文本（`UButton::OnClicked` 不带参数，所以按钮是数组、文本取它唯一的孩子）。
+    for (const TObjectPtr<UButton>& MenuButton : ContextMenuButtons)
+    {
+        if (MenuButton)
+        {
+            if (UTextBlock* MenuLabel = Cast<UTextBlock>(MenuButton->GetChildAt(0)))
+            {
+                MenuLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
+            }
+        }
+    }
+
+    for (const TObjectPtr<UTextBlock>& PanelTitle : PanelTitles)
+    {
+        if (PanelTitle)
+        {
+            PanelTitle->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", PanelFont));
+        }
+    }
+
+    for (const TObjectPtr<UTextBlock>& Caption : CaptionLabels)
+    {
+        if (Caption)
+        {
+            Caption->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", LabelFont));
+        }
+    }
+}
+
+void UInvInventoryScreenWidget::LayoutHeaderAtOrigin(float InCellSize)
+{
+    if (!RootCanvas)
+    {
+        return;
+    }
+
+    // 旧口径：提示行在 `Origin` 上方，负重条 / 条上文本贴着 `Origin`，「整理」按钮在条的右边。
+    const int32 LabelFont = ScaledFontSize(LabelFontBase, InCellSize);
+    const float BarWidth = FMath::Max(MinPanelWidth - SortButtonWidth - 8.f, 80.f);
+
+    if (TitleLabel)
+    {
+        PlaceInCanvas(TitleLabel, FVector2D(Origin.X, Origin.Y - LabelFont - InvUiScreenTitleGap),
+            FVector2D(MinPanelWidth, LabelFont + 4.f));
+    }
+    if (WeightBar)
+    {
+        PlaceInCanvas(WeightBar, Origin, FVector2D(BarWidth, InvUiScreenBarHeight));
+    }
+    if (WeightLabel)
+    {
+        PlaceInCanvas(WeightLabel, Origin + FVector2D(6.f, 2.f),
+            FVector2D(BarWidth - 12.f, InvUiScreenBarHeight - 4.f));
+    }
+    if (SortButton)
+    {
+        PlaceInCanvas(SortButton, FVector2D(Origin.X + MinPanelWidth - SortButtonWidth, Origin.Y),
+            FVector2D(SortButtonWidth, InvUiScreenBarHeight));
+    }
+}
+
+void UInvInventoryScreenWidget::LayoutManual()
+{
+    if (!RootCanvas)
+    {
+        return;
+    }
+
+    // 兼容模式：完全退回旧行为——子格子从 `Origin` 左上角起、每容器一行、`CellSize` 原样（不缩放不居中）。
+    const float Cell = ManualCellSize();
+    SyncPanelDecor(0);
+    SetPanelDecorVisible(false);
+    ApplyFonts(Cell);
+    LayoutHeaderAtOrigin(Cell);
+    LayoutGrids();
+
+    ScreenLayout.CellSize = Cell;
+    ScreenLayout.TotalSize = FVector2D::ZeroVector;   // 旧口径没有「整屏尺寸」这个概念
+    ScreenLayout.PanelOrigin = Origin;
+}
+
+void UInvInventoryScreenWidget::LayoutCentered()
+{
+    if (!RootCanvas)
+    {
+        return;
+    }
+
+    const float Cell = FontCellSize();
+    const FVector2D Spacing = EffectivePanelSpacing();
+
+    TArray<FInvScreenPanelRect> Panels;
+    BuildPanelRects(Cell, Panels);
+
+    SyncPanelDecor(Panels.Num());
+
+    if (Panels.Num() <= 0)
+    {
+        // 一块面板都没有（没绑定组件 / 没有任何根容器）：退回旧口径的提示 + 负重条，不画底板。
+        SetPanelDecorVisible(false);
+        ApplyFonts(Cell);
+        LayoutHeaderAtOrigin(Cell);
+
+        ScreenLayout.CellSize = Cell;
+        ScreenLayout.TotalSize = FVector2D::ZeroVector;
+        ScreenLayout.PanelOrigin = Origin;
+        return;
+    }
+
+    const FVector2D ClusterSize = MeasureClusterSize(Cell);
+    const FVector2D TotalSize = ClusterSize + Spacing * 2.f;
+    const FVector2D Viewport = ResolveViewportSize();
+    const bool bSizeKnown = Viewport.X > 0.f && Viewport.Y > 0.f;
+
+    // 居中：整屏相对 viewport 正中（主面板中心 = 整屏中心）；尺寸未知（没上屏 / 无头命令集）时
+    // 退回「从 `Origin` 起摆」，此时 `Origin` 就是整屏左上角（旧语义），不做居中偏移。
+    const FVector2D Centering = bSizeKnown ? (Viewport - TotalSize) * 0.5f : FVector2D::ZeroVector;
+    const FVector2D PanelOrigin = Centering + Origin;
+    const FVector2D ClusterCenter = PanelOrigin + Spacing + ClusterSize * 0.5f;
+
+    ScreenLayout.CellSize = Cell;
+    ScreenLayout.TotalSize = bSizeKnown ? TotalSize : FVector2D::ZeroVector;
+    ScreenLayout.PanelOrigin = PanelOrigin;
+
+    ApplyFonts(Cell);
+
+    const float Padding = InvUiScreenScaled(InvUiScreenPanelPaddingBase, Cell);
+    const float CaptionH = InvUiScreenCaptionHeight(Cell);
+    const int32 PanelFont = TitleFontSize(Cell);
+    const float Radius = InvUiScreenScaled(PanelCornerRadiusBase, Cell);
+    const float PanelOpacity = FMath::Clamp(BackgroundOpacity, 0.f, 1.f);
+    const float LabelFont = (float)ScaledFontSize(LabelFontBase, Cell) * 1.25f;
+
+    for (int32 Index = 0; Index < Panels.Num(); ++Index)
+    {
+        const FInvScreenPanelRect& Panel = Panels[Index];
+        const FVector2D PanelPos = ClusterCenter + Panel.Position;
+        const bool bMain = Panel.Slot == EInvScreenPanelSlot::Main;
+
+        if (PanelContainers.IsValidIndex(Index))
+        {
+            PanelContainers[Index] = Panel.Container;
+        }
+
+        // 底板（圆角 + 描边）：不透明度跟着 `BackgroundOpacity` 走。
+        if (PanelBoards.IsValidIndex(Index) && PanelBoards[Index])
+        {
+            PanelBoards[Index]->SetBrush(InvUiScreenRoundedBrush(
+                FLinearColor(InvUiScreenPanelColor.R, InvUiScreenPanelColor.G, InvUiScreenPanelColor.B, PanelOpacity),
+                InvUiScreenPanelOutline, Radius));
+            PanelBoards[Index]->SetVisibility(ESlateVisibility::Visible);
+            PlaceInCanvas(PanelBoards[Index], PanelPos, Panel.Size, InvUiScreenPanelZOrder + Index * 2);
+        }
+
+        // 标题栏：底条 + 容器标题（主面板的标题栏里还有负重条与文本）。
+        const float TitleContents = bMain
+            ? InvUiScreenWeightBarHeight(Cell) + InvUiScreenTitleBarBottomPadding
+            : 0.f;
+        const float TitleBarH = InvUiScreenTitleBarHeight(TitleHeight, Cell, PanelFont, TitleContents);
+        const float BarWidth = bMain ? InvUiScreenWeightBarWidth(Panel.Size.X) : 0.f;
+
+        if (PanelTitleBars.IsValidIndex(Index) && PanelTitleBars[Index])
+        {
+            PanelTitleBars[Index]->SetBrush(
+                InvUiScreenRoundedBrush(InvUiScreenTitleBarColor, FLinearColor::Transparent, Radius));
+            PanelTitleBars[Index]->SetVisibility(ESlateVisibility::Visible);
+            PlaceInCanvas(PanelTitleBars[Index], PanelPos, FVector2D(Panel.Size.X, TitleBarH),
+                InvUiScreenPanelZOrder + Index * 2 + 1);
+        }
+
+        if (PanelTitles.IsValidIndex(Index) && PanelTitles[Index])
+        {
+            const FString Label = Inventory ? Inventory->GetContainerLabel(Panel.Container) : FString();
+            const float TitleWidth = FMath::Max(
+                Panel.Size.X - Padding * 2.f - (bMain ? BarWidth + Padding : 0.f), 40.f);
+
+            PanelTitles[Index]->SetText(FText::FromString(Label.IsEmpty()
+                ? FString::Printf(TEXT("容器 %lld"), Panel.Container)
+                : Label));
+            PanelTitles[Index]->SetVisibility(ESlateVisibility::Visible);
+            PlaceInCanvas(PanelTitles[Index],
+                PanelPos + FVector2D(Padding, FMath::Max((TitleBarH - LabelFont) * 0.5f, 0.f)),
+                FVector2D(TitleWidth, FMath::Max(LabelFont, 1.f)));
+        }
+
+        if (bMain)
+        {
+            // 负重条 + 条上的文本：摆在标题栏右侧。
+            const float BarH = InvUiScreenWeightBarHeight(Cell);
+            const FVector2D BarPos(
+                PanelPos.X + Panel.Size.X - Padding - BarWidth,
+                PanelPos.Y + FMath::Max((TitleBarH - BarH) * 0.5f, 0.f));
+
+            if (WeightBar)
+            {
+                PlaceInCanvas(WeightBar, BarPos, FVector2D(BarWidth, BarH));
+            }
+            if (WeightLabel)
+            {
+                PlaceInCanvas(WeightLabel, BarPos + FVector2D(6.f, 2.f), FVector2D(BarWidth - 12.f, BarH - 4.f));
+            }
+
+            // 「整理」按钮：主面板右下角（占面板底边预留的那一条）。
+            if (SortButton)
+            {
+                const FVector2D ButtonSize = InvUiScreenSortButtonSize(Cell);
+                PlaceInCanvas(SortButton, FVector2D(
+                    PanelPos.X + Panel.Size.X - Padding - ButtonSize.X,
+                    PanelPos.Y + Panel.Size.Y - Padding - ButtonSize.Y), ButtonSize);
+            }
+        }
+
+        // 子格子：同一容器的多块并排，各自上方一行小标题。
+        TArray<UInvGridWidget*> PanelGrids;
+        CollectGridsOfContainer(Panel.Container, PanelGrids);
+
+        const float ContentTop = PanelPos.Y + Padding + TitleBarH;
+        float CursorX = PanelPos.X + Padding;
+        for (UInvGridWidget* Grid : PanelGrids)
+        {
+            const FVector2D GridSize = Grid->GetGridPixelSize();
+
+            const int32 FlatIndex = GridWidgets.IndexOfByPredicate(
+                [Grid](const TObjectPtr<UInvGridWidget>& Candidate) { return Candidate == Grid; });
+            if (CaptionLabels.IsValidIndex(FlatIndex) && CaptionLabels[FlatIndex])
+            {
+                UTextBlock* Caption = CaptionLabels[FlatIndex];
+                Caption->SetText(FText::FromString(Grid->GetGridTitle()));
+                PlaceInCanvas(Caption, FVector2D(CursorX, ContentTop),
+                    FVector2D(FMath::Max(GridSize.X, 64.f), CaptionH));
+            }
+
+            PlaceInCanvas(Grid, FVector2D(CursorX, ContentTop + CaptionH), GridSize);
+            CursorX += GridSize.X + InvUiScreenGridSpacing;
+        }
+    }
+
+    SetPanelDecorVisible(true);
+}
+
+void UInvInventoryScreenWidget::ApplyLayout()
+{
+    if (!RootCanvas)
+    {
+        return;
+    }
+
+    if (bCenterOnViewport)
+    {
+        LayoutCentered();
+    }
+    else
+    {
+        LayoutManual();
+    }
+}
+
 void UInvInventoryScreenWidget::Refresh()
 {
     // 1) 负重：条 + 文本（构造前也能算，纯读组件）。
     UpdateWeightDisplay();
 
-    // 2) 控件树：没有就建（只建 UObject 层，无头命令集里也能建），建不出来就只留文本层。
+    // 2) 这次要用的单格边长：居中模式下按当前 viewport 自适应缩放（分辨率变了这里就跟着变）。
+    UpdateEffectiveCellSize();
+
+    // 3) 控件树：没有就建（只建 UObject 层，无头命令集里也能建），建不出来就只留文本层。
     EnsureContentBuilt();
     if (!RootCanvas)
     {
         return;
     }
 
-    // 3) 子格子：缺的补、多的隐藏。
+    // 4) 子格子：缺的补、多的隐藏（尺寸用第 2 步算出来的实际边长）。
     TArray<FInvGridSlotKey> Desired;
     CollectDesiredGrids(Desired);
     SyncGridWidgets(Desired);
 
-    // 4) 布局：格子的尺寸 / 位置 / 标题。
-    LayoutGrids();
+    // 5) 布局：面板（居中模式）/ 逐行（手动模式）+ 格子尺寸 / 位置 / 标题。
+    ApplyLayout();
 
     InvalidateLayoutAndVolatility();
 }

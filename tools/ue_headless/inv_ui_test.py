@@ -10,7 +10,9 @@
 #      自动换向重试 / 与占位物品交换）→ RotateDraggedOrSelected → CancelDrag；
 #   W. 控件构造：NewObject 出 UInvGridWidget / UInvInventoryScreenWidget，EnsureConstructed 走完构造
 #      （空配置也不崩）+ 负重文本 + tooltip 文本；
-#   R. 「整理」：对当前格子 / 背包调 AutosortContainer，物品一件不少。
+#   R. 「整理」：对当前格子 / 背包调 AutosortContainer，物品一件不少；
+#   L. 屏幕布局：ComputeScreenLayout 纯函数（居中 / 超限自动缩小 / 下限 / 非法参数）、字号缩放、
+#      默认值、居中模式的面板排布（主面板居中、弹挂左 / 安全箱右 / 口袋下）、兼容模式退回 Origin 语义。
 #
 # 只走公开蓝图节点（UFUNCTION），不碰内部函数。结果写脚本同目录 inv_ui_test_out.txt（末行 SUMMARY）；
 # 每个失败行都带实际值，方便直接定位。
@@ -26,8 +28,9 @@ OUT = os.path.join(_HERE, "inv_ui_test_out.txt")
 LINES = []
 PASS = 0
 FAIL = 0
-KEEP = []     # 强引用，防临时对象被回收
-_PROBE = []   # 静态函数调用兜底用的控件实例
+KEEP = []            # 强引用，防临时对象被回收
+_PROBE = []          # 格子控件的静态函数调用兜底用的实例
+_SCREEN_PROBE = []   # 界面控件的静态函数调用兜底用的实例
 
 
 def emit(msg):
@@ -120,6 +123,64 @@ def call_static(name, *args):
     except Exception as second:
         note("静态函数 %s 两种调用方式都失败：%s / %s" % (name, first, second))
         return None
+
+
+def call_screen_static(name, *args):
+    """调界面控件上的静态蓝图节点：python 里挂在类上（staticmethod），失败再用实例兜底。"""
+    first = None
+    try:
+        return getattr(unreal.InvInventoryScreenWidget, name)(*args)
+    except Exception as error:
+        first = error
+    try:
+        if not _SCREEN_PROBE:
+            _SCREEN_PROBE.append(unreal.new_object(unreal.InvInventoryScreenWidget))
+        return getattr(_SCREEN_PROBE[0], name)(*args)
+    except Exception as second:
+        note("界面静态函数 %s 两种调用方式都失败：%s / %s" % (name, first, second))
+        return None
+
+
+def slot_rect(widget):
+    """控件在根画布上的矩形 `(x, y, 宽, 高)`；没挂到画布上（没有槽位）返回 None。"""
+    slot = attr(widget, "slot")
+    if slot is None or not hasattr(slot, "get_position"):
+        return None
+    pos = slot.get_position()
+    size = slot.get_size()
+    return (pos.x, pos.y, size.x, size.y)
+
+
+def slot_zorder(widget):
+    """控件在根画布上的层级（负数 = 画在下面）；读不到返回 None。
+
+    python 侧的名字不一定是 `get_zorder`：UE 的驼峰转蛇形会把 `GetZOrder` 拆成 `get_z_order`，
+    所以这里按候选名逐个找（函数或属性）。
+    """
+    slot = attr(widget, "slot")
+    if slot is None:
+        return None
+
+    for name in ("get_z_order", "get_zorder", "z_order", "zorder"):
+        candidate = getattr(slot, name, None)
+        if candidate is None:
+            continue
+        try:
+            value = candidate() if callable(candidate) else candidate
+        except Exception:
+            continue
+        if value is not None:
+            return int(value)
+    return None
+
+
+def rect_contains(outer, inner, tol=0.01):
+    """`inner` 是否落在 `outer` 里（容差 `tol` 像素）；任一为 None 返回 False。"""
+    if outer is None or inner is None:
+        return False
+    return (inner[0] >= outer[0] - tol and inner[1] >= outer[1] - tol
+            and inner[0] + inner[2] <= outer[0] + outer[2] + tol
+            and inner[1] + inner[3] <= outer[1] + outer[3] + tol)
 
 
 def make_def(name, w, h, stack=1, rot=False, weight=0.0, value=0, display="", parts=None):
@@ -708,6 +769,253 @@ def section_cross_container():
     check(again == 23, "X13 源格子没在拖时再交接 → 23（实际 %s）" % again)
 
 
+# ==================== L. 屏幕布局（居中 / 自适应 / 兼容模式） ====================
+
+def section_layout():
+    emit("----- L. 屏幕布局（ComputeScreenLayout / 字号缩放 / 面板排布 / 兼容模式）-----")
+
+    # ---- 1. 纯函数：1920×1080 + 期望 64 + 0.85 → 放得下就不缩，整屏居中 ----
+    full = call_screen_static("compute_screen_layout", v2(1920.0, 1080.0), 64.0, 0.85, 24.0, v2(24.0, 18.0))
+    check(full is not None, "L1 ComputeScreenLayout 可用（返回 %s）" % type(full).__name__)
+    if full is None:
+        return
+
+    check(abs(full.cell_size - 64.0) < 1e-3,
+          "L2 1920x1080 / 期望 64 / 0.85 → CellSize = %s（期望 64：放得下就不缩放）" % full.cell_size)
+    center = (full.panel_origin.x + full.total_size.x * 0.5, full.panel_origin.y + full.total_size.y * 0.5)
+    check(abs(center[0] - 960.0) <= 1.0 and abs(center[1] - 540.0) <= 1.0,
+          "L3 整屏居中：PanelOrigin + TotalSize/2 = %s（期望 (960, 540)，误差 ≤ 1px）" % (center,))
+
+    # ---- 2. 极小 viewport：自动缩小、不超 85%、不低于下限、仍然居中 ----
+    small = call_screen_static("compute_screen_layout", v2(640.0, 360.0), 64.0, 0.85, 24.0, v2(24.0, 18.0))
+    fit = (640.0 * 0.85, 360.0 * 0.85)
+    check(small is not None and 24.0 <= small.cell_size < 64.0,
+          "L4 640x360 → 自动缩小：CellSize = %s（期望 ≥ 24 且 < 64）"
+          % (small.cell_size if small else None))
+    check(small is not None and small.total_size.x <= fit[0] + 0.01 and small.total_size.y <= fit[1] + 0.01,
+          "L5 缩小后整屏不超 85%%：TotalSize = %s（上界 %s）"
+          % ((small.total_size.x, small.total_size.y) if small else None, fit))
+    if small is not None:
+        small_center = (small.panel_origin.x + small.total_size.x * 0.5,
+                        small.panel_origin.y + small.total_size.y * 0.5)
+        check(abs(small_center[0] - 320.0) <= 1.0 and abs(small_center[1] - 180.0) <= 1.0,
+              "L6 缩小之后仍然居中：%s（期望 (320, 180)）" % (small_center,))
+
+    # ---- 3. 期望值非法（0 / 负数）→ 结果仍为正且不低于下限 ----
+    for label, desired in (("0", 0.0), ("-8", -8.0)):
+        bad = call_screen_static("compute_screen_layout", v2(1280.0, 720.0), desired, 0.85, 24.0, v2(24.0, 18.0))
+        check(bad is not None and bad.cell_size > 0.0 and bad.cell_size >= 24.0 - 1e-3,
+              "L7 DesiredCellSize = %s → CellSize = %s（期望 ≥ 24 且 > 0）"
+              % (label, bad.cell_size if bad else None))
+
+    # ---- 4. 退化参数（viewport 0 / 占比 0 / 下限 0 / 负间距）→ 不崩且不出现非正数 ----
+    degenerate = call_screen_static("compute_screen_layout", v2(0.0, 0.0), 64.0, 0.0, 0.0, v2(-5.0, -5.0))
+    check(degenerate is not None and degenerate.cell_size > 0.0
+          and degenerate.total_size.x > 0.0 and degenerate.total_size.y > 0.0,
+          "L8 viewport (0,0) + 非法占比 / 下限 / 间距 → 结果仍是正数（CellSize %s / TotalSize %s）"
+          % (degenerate.cell_size if degenerate else None,
+             (degenerate.total_size.x, degenerate.total_size.y) if degenerate else None))
+
+    # ---- 5. 默认值：新构造的界面控件 ----
+    fresh = unreal.new_object(unreal.InvInventoryScreenWidget)
+    KEEP.append(fresh)
+    check(abs(float(attr(fresh, "desired_cell_size")) - 64.0) < 1e-4,
+          "L9 新界面控件的 DesiredCellSize = %s（默认 64）" % attr(fresh, "desired_cell_size"))
+    check(bool_attr(fresh, "center_on_viewport") is True, "L10 bCenterOnViewport 默认 true")
+    check(abs(float(attr(fresh, "cell_size")) - 64.0) < 1e-4,
+          "L11 CellSize 默认 64（兼容模式的手动值）")
+    check(xy(attr(fresh, "origin")) == (0.0, 0.0), "L12 Origin 默认 (0,0)（居中后的额外偏移）")
+    check(abs(float(attr(fresh, "max_screen_fraction")) - 0.85) < 1e-4
+          and abs(float(attr(fresh, "min_cell_size")) - 24.0) < 1e-4,
+          "L13 MaxScreenFraction / MinCellSize 默认 = %s / %s"
+          % (attr(fresh, "max_screen_fraction"), attr(fresh, "min_cell_size")))
+    check(xy(attr(fresh, "panel_spacing")) == (24.0, 18.0)
+          and abs(float(attr(fresh, "background_opacity")) - 0.85) < 1e-4
+          and abs(float(attr(fresh, "title_height")) - 40.0) < 1e-4,
+          "L14 PanelSpacing / BackgroundOpacity / TitleHeight 默认 = %s / %s / %s"
+          % (xy(attr(fresh, "panel_spacing")), attr(fresh, "background_opacity"), attr(fresh, "title_height")))
+
+    # ---- 6. 字号缩放工具（不再写死 12pt） ----
+    scaled = (call_screen_static("scaled_font_size", 16, 64.0),
+              call_screen_static("scaled_font_size", 16, 48.0),
+              call_screen_static("scaled_font_size", 16, 24.0))
+    check(scaled == (16, 12, 10),
+          "L15 ScaledFontSize(16) 在 64 / 48 / 24 的单格边长下 = %s（期望 (16, 12, 10)，下限 10）" % (scaled,))
+    check(call_screen_static("title_font_size", 64.0) == 26 and call_screen_static("title_font_size", 24.0) == 14,
+          "L16 TitleFontSize = 单格边长 × 0.4、下限 14（64 → %s / 24 → %s）"
+          % (call_screen_static("title_font_size", 64.0), call_screen_static("title_font_size", 24.0)))
+
+    # ---- 7. 实例布局：居中模式的面板排布（主面板 = 背包） ----
+    ammo = make_def("UiDef_Layout", 1, 1, stack=60, weight=0.01, value=2, display="子弹")
+    comp, ok = make_comp("UiComp_Layout", [ammo],
+                         [make_root(BP, "背包", [(6, 5)]),
+                          make_root(CHESTRIG, "弹挂", [(1, 1), (1, 2)]),
+                          make_root(SAFEBOX, "安全箱", [(4, 3)]),
+                          make_root(POCKETS, "口袋", [(1, 1)] * 4)],
+                         cap=20.0)
+    check(ok, "L17 组件 InitializeInventory 成功")
+    if not ok:
+        return
+
+    backpack = container_of(comp, BP)
+    rig = container_of(comp, CHESTRIG)
+    safebox = container_of(comp, SAFEBOX)
+    pockets = container_of(comp, POCKETS)
+
+    screen = unreal.new_object(unreal.InvInventoryScreenWidget)
+    KEEP.append(screen)
+    screen.set_editor_property("inventory", comp)
+    screen.set_editor_property("cell_size", 48.0)
+    screen.refresh()
+
+    check(abs(screen.get_effective_cell_size() - 48.0) < 1e-4,
+          "L18 拿不到 viewport 尺寸时按 CellSize 走：EffectiveCellSize = %s（无头 / 服务器下的确定性口径）"
+          % screen.get_effective_cell_size())
+
+    boards = [b for b in screen.get_panel_boards() if b is not None]
+    containers = list(screen.get_panel_containers())
+    check(len(boards) == 4 and len(containers) == 4 and containers[0] == backpack,
+          "L19 4 个容器 → 4 块面板底板，下标 0 = 主面板（背包）：%s" % (containers,))
+    if len(boards) != 4:
+        return
+
+    check(containers[1] == rig and containers[2] == safebox and containers[3] == pockets,
+          "L20 面板顺序 = 主 / 左（弹挂）/ 右（安全箱）/ 下（口袋）：%s" % (containers,))
+
+    r_main = slot_rect(boards[0])
+    r_left = slot_rect(boards[1])
+    r_right = slot_rect(boards[2])
+    r_bottom = slot_rect(boards[3])
+    check(r_main is not None and r_main[2] > 0.0 and r_main[3] > 0.0,
+          "L21 主面板底板有实际尺寸：%s" % (r_main,))
+    check(r_left is not None and r_main is not None and r_left[0] + r_left[2] <= r_main[0] + 0.01,
+          "L22 弹挂面板在主面板左侧：弹挂 %s / 背包 %s" % (r_left, r_main))
+    check(r_right is not None and r_main is not None and r_right[0] >= r_main[0] + r_main[2] - 0.01,
+          "L23 安全箱面板在主面板右侧：安全箱 %s / 背包 %s" % (r_right, r_main))
+    check(r_bottom is not None and r_main is not None and r_bottom[1] >= r_main[1] + r_main[3] - 0.01,
+          "L24 口袋面板在主面板下方：口袋 %s / 背包 %s" % (r_bottom, r_main))
+
+    main_grids = [g for g in screen.get_grid_widgets()
+                  if g is not None and int(attr(g, "container")) == backpack]
+    r_button = None   # 后面几条断言要拿它跟「单格边长 96」的按钮对比
+    check(len(main_grids) == 1, "L25 主面板里 1 块子格子（6x5 背包）：%d" % len(main_grids))
+    if main_grids:
+        r_grid = slot_rect(main_grids[0])
+        check(rect_contains(r_main, r_grid),
+              "L26 背包子格子落在主面板底板里：格子 %s ⊂ 面板 %s" % (r_grid, r_main))
+        z_board = slot_zorder(boards[0])
+        z_grid = slot_zorder(main_grids[0])
+        check(z_board is not None and z_grid is not None and z_board < z_grid,
+              "L27 背景板画在子控件下面（底板 ZOrder %s < 格子 ZOrder %s）" % (z_board, z_grid))
+
+        r_bar = slot_rect(screen.weight_bar)
+        check(r_bar is not None and rect_contains(r_main, r_bar) and r_bar[1] < r_grid[1],
+              "L28 负重条在主面板标题栏里（条 %s ⊂ 面板 %s，且在格子上方）" % (r_bar, r_main))
+
+        r_button = slot_rect(screen.sort_button)
+        check(r_button is not None and rect_contains(r_main, r_button)
+              and r_button[0] + r_button[2] >= r_main[0] + r_main[2] - 16.0
+              and r_button[1] + r_button[3] >= r_main[1] + r_main[3] - 16.0,
+              "L29 「整理」按钮在主面板右下角：按钮 %s / 面板 %s" % (r_button, r_main))
+
+        check(main_grids[0].get_stack_badge_font_size() == 12 and main_grids[0].get_tooltip_font_size() == 12,
+              "L30 子格子在 48 的单格边长下角标 / tooltip 字号 = %s / %s（老口径 12 不变）"
+              % (main_grids[0].get_stack_badge_font_size(), main_grids[0].get_tooltip_font_size()))
+        main_grids[0].set_editor_property("cell_size", 96.0)
+        main_grids[0].refresh()
+        check(main_grids[0].get_stack_badge_font_size() == 24 and main_grids[0].get_tooltip_font_size() == 24,
+              "L31 单格边长翻倍到 96 → 角标 / tooltip 字号跟着到 %s / %s"
+              % (main_grids[0].get_stack_badge_font_size(), main_grids[0].get_tooltip_font_size()))
+        main_grids[0].set_editor_property("cell_size", 48.0)
+
+    titles = [t for t in screen.panel_titles if t is not None]
+    title_texts = [str(t.get_text()) for t in titles]
+    check(len(titles) == 4 and "背包" in title_texts[0] and "弹挂" in title_texts[1],
+          "L32 每块面板都有容器标题：%s" % (title_texts,))
+
+    # ---- 8. 默认配置（不填 CellSize）→ 单格边长 64 ----
+    default_screen = unreal.new_object(unreal.InvInventoryScreenWidget)
+    KEEP.append(default_screen)
+    default_screen.set_editor_property("inventory", comp)
+    default_screen.refresh()
+    default_grids = [g for g in default_screen.get_grid_widgets()
+                     if g is not None and int(attr(g, "container")) == backpack]
+    size = default_grids[0].get_grid_pixel_size() if default_grids else None
+    check(abs(default_screen.get_effective_cell_size() - 64.0) < 1e-4 and size is not None
+          and abs(size.x - 384.0) < 1e-4 and abs(size.y - 320.0) < 1e-4,
+          "L33 默认配置（不填 CellSize）单格边长 64：背包 6x5 → %s（期望 (384, 320)）"
+          % ((size.x, size.y) if size else None,))
+
+    # ---- 9. 兼容模式（bCenterOnViewport = false）→ 完全退回 Origin 语义 ----
+    compat = unreal.new_object(unreal.InvInventoryScreenWidget)
+    KEEP.append(compat)
+    compat.set_editor_property("inventory", comp)
+    compat.set_editor_property("cell_size", 48.0)
+    compat.set_editor_property("center_on_viewport", False)
+    compat.set_editor_property("origin", v2(40.0, 140.0))
+    compat.refresh()
+
+    compat_layout = compat.get_screen_layout()
+    check(abs(compat_layout.cell_size - 48.0) < 1e-4 and xy(compat_layout.panel_origin) == (40.0, 140.0)
+          and xy(compat_layout.total_size) == (0.0, 0.0),
+          "L34 兼容模式退回 Origin 语义：CellSize %s / PanelOrigin %s / TotalSize %s"
+          % (compat_layout.cell_size, xy(compat_layout.panel_origin), xy(compat_layout.total_size)))
+
+    compat_boards = [b for b in compat.get_panel_boards() if b is not None]
+    check(all(b.get_visibility() == unreal.SlateVisibility.COLLAPSED for b in compat_boards),
+          "L35 兼容模式不画面板底板（%d 块全是 Collapsed）" % len(compat_boards))
+
+    compat_grids = [g for g in compat.get_grid_widgets() if g is not None]
+    r_compat = slot_rect(compat_grids[0]) if compat_grids else None
+    check(r_compat is not None and abs(r_compat[0] - 40.0) < 0.01 and r_compat[1] >= 140.0,
+          "L36 兼容模式下子格子从 Origin 左上角起排：%s（x = Origin.X = 40，y 在 Origin.Y 之下）" % (r_compat,))
+
+    # ---- 10. 只有背包：一块面板，主面板自身就是整屏（纯居中放大） ----
+    solo_comp, solo_ok = make_comp("UiComp_Solo", [ammo], [make_root(BP, "背包", [(6, 5)])], cap=20.0)
+    check(solo_ok, "L37 只有背包的组件 InitializeInventory 成功")
+    if not solo_ok:
+        return
+
+    solo = unreal.new_object(unreal.InvInventoryScreenWidget)
+    KEEP.append(solo)
+    solo.set_editor_property("inventory", solo_comp)
+    solo.set_editor_property("cell_size", 48.0)
+    solo.refresh()
+
+    solo_containers = list(solo.get_panel_containers())
+    solo_boards = [b for b in solo.get_panel_boards() if b is not None]
+    solo_grids = [g for g in solo.get_grid_widgets()
+                  if g is not None and int(attr(g, "container")) == container_of(solo_comp, BP)]
+    check(len(solo_boards) == 1 and solo_containers == [container_of(solo_comp, BP)],
+          "L38 只有背包时只画 1 块面板（就是背包这一块）：%s" % (solo_containers,))
+
+    r_solo = slot_rect(solo_boards[0]) if solo_boards else None
+    r_solo_grid = slot_rect(solo_grids[0]) if solo_grids else None
+    check(r_solo is not None and r_solo_grid is not None
+          and abs((r_solo[0] + r_solo[2] * 0.5) - (r_solo_grid[0] + r_solo_grid[2] * 0.5)) < 0.01,
+          "L39 只有背包时格子水平居中于面板：格子 %s / 面板 %s" % (r_solo_grid, r_solo))
+
+    # viewport 未知时整屏左上角 = Origin + PanelSpacing，且簇 = 主面板自身 → 面板中心 = 间距 + 面板尺寸 / 2。
+    solo_spacing = xy(attr(solo, "panel_spacing"))
+    check(r_solo is not None and solo_spacing is not None
+          and abs((r_solo[0] + r_solo[2] * 0.5) - (solo_spacing[0] + r_solo[2] * 0.5)) < 0.01
+          and abs((r_solo[1] + r_solo[3] * 0.5) - (solo_spacing[1] + r_solo[3] * 0.5)) < 0.01,
+          "L40 只有背包时整屏就是这一块面板，左上角落在 Origin + PanelSpacing：面板 %s / 间距 %s"
+          % (r_solo, solo_spacing))
+
+    # ---- 11. 「整理」按钮尺寸随单格边长缩放（96 vs 48） ----
+    big = unreal.new_object(unreal.InvInventoryScreenWidget)
+    KEEP.append(big)
+    big.set_editor_property("inventory", solo_comp)
+    big.set_editor_property("cell_size", 96.0)
+    big.refresh()
+    r_big_button = slot_rect(big.sort_button)
+    check(r_button is not None and r_big_button is not None
+          and r_big_button[2] > r_button[2] and r_big_button[3] > r_button[3],
+          "L41 「整理」按钮尺寸随单格边长缩放：48 → %s / 96 → %s"
+          % ((r_button[2], r_button[3]) if r_button else None, (r_big_button[2], r_big_button[3]) if r_big_button else None))
+
+
 # ==================== 主流程 ====================
 
 def main():
@@ -731,6 +1039,8 @@ def main():
     section_widgets()
     dump()
     section_autosort()
+    dump()
+    section_layout()
     emit("===== 结束 =====")
 
 

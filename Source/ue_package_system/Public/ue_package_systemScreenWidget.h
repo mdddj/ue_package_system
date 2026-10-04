@@ -12,6 +12,7 @@
 class UBorder;
 class UButton;
 class UCanvasPanel;
+class UImage;
 class UProgressBar;
 class USoundBase;
 class UTextBlock;
@@ -75,17 +76,95 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FInvItemDestroyedEvent, FInvItemView
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FInvOperationFailedEvent, int32, Code, FString, Message);
 
 /**
+ * 整屏布局解算结果（`ComputeScreenLayout` 的返回值，也是 `ScreenLayout` 的镜像字段）。
+ *
+ * 三个值的含义：面板左上角在 viewport 坐标系里的位置、整屏尺寸（含面板四周留白）、实际生效的单格边长。
+ */
+USTRUCT(BlueprintType)
+struct FInvScreenLayout
+{
+    GENERATED_BODY()
+
+    /** 实际生效的单格边长（像素）；`<= 0` 表示还没算过。 */
+    UPROPERTY(BlueprintReadOnly, Category = "背包界面")
+    float CellSize = 0.f;
+
+    /** 整屏尺寸（像素，含面板四周留白）：面板簇 + 两倍 `PanelSpacing`。 */
+    UPROPERTY(BlueprintReadOnly, Category = "背包界面")
+    FVector2D TotalSize = FVector2D::ZeroVector;
+
+    /** 整屏左上角在 viewport 坐标系里的位置（居中时 `PanelOrigin + TotalSize / 2 = ViewportSize / 2`）。 */
+    UPROPERTY(BlueprintReadOnly, Category = "背包界面")
+    FVector2D PanelOrigin = FVector2D::ZeroVector;
+};
+
+/**
+ * 容器面板在整屏里的排布槽位。
+ *
+ * 主面板（背包）居中，其余贴上去：左边一列（弹挂）、右边一列（安全箱）、下面一行（口袋），
+ * 认不出槽位的容器一律往下堆（`Extra`）。
+ */
+enum class EInvScreenPanelSlot : uint8
+{
+    /** 主面板：背包，摆在正中间。 */
+    Main,
+
+    /** 主面板左边一列：弹挂。 */
+    Left,
+
+    /** 主面板右边一列：安全箱。 */
+    Right,
+
+    /** 主面板下面一行：口袋。 */
+    Bottom,
+
+    /** 其它容器：继续往下堆。 */
+    Extra,
+};
+
+/**
+ * 一块容器面板在布局里的尺寸与位置（界面内部用，不反射）。
+ *
+ * `Position` 是**簇坐标**：主面板中心 = 原点，所以主面板的位置是 `-Size / 2`，左边面板的 X 是负的。
+ */
+struct FInvScreenPanelRect
+{
+    /** 容器句柄。 */
+    int64 Container = 0;
+
+    /** 排布槽位。 */
+    EInvScreenPanelSlot Slot = EInvScreenPanelSlot::Extra;
+
+    /** 面板尺寸（像素，含标题栏与内边距）。 */
+    FVector2D Size = FVector2D::ZeroVector;
+
+    /** 面板左上角（簇坐标）；主面板中心在原点。 */
+    FVector2D Position = FVector2D::ZeroVector;
+};
+
+/**
  * 背包界面：把几个 `UInvGridWidget`（每个容器子网格一块）拼成一屏，外加负重条与「整理」按钮。
  *
- * 零资产：子控件（`UCanvasPanel` / `UTextBlock` / `UProgressBar` / `UButton`）全部在 C++ 里
- * `ConstructWidget` 出来，用引擎默认样式与默认字体；不需要任何 Widget Blueprint、贴图或字体资产。
+ * 零资产：子控件（`UCanvasPanel` / `UImage` / `UTextBlock` / `UProgressBar` / `UButton`）全部在 C++ 里
+ * `ConstructWidget` 出来，用引擎默认样式、默认字体与纯色圆角笔刷；不需要任何 Widget Blueprint、贴图或字体资产。
  * 直接 `Create Widget`（`Class = 背包界面控件`）→ 填 `Inventory` → `Add To Viewport` 就能用。
  *
- * 自动布局：`ShowTypes` 里每个**存在**的根容器 → 它的每块子网格一块 `UInvGridWidget`
- * （同一容器的多块并排一行，行上方有小标题如 `弹挂 part2 (1x2)`），容器之间换行；
- * 左上角从 `Origin` 开始摆。
+ * 布局（`bCenterOnViewport` 默认开 = 居中模式）：整屏相对 viewport **水平垂直居中**，
+ * **背包是主面板放在正中间**，其余容器按「存在与否」贴上去——左边一列 = 弹挂，右边一列 = 安全箱，
+ * 下面一行 = 口袋，其它容器继续往下堆。只有背包时就是纯居中。
+ * 每块容器面板 = 半透明深色圆角底板（`BackgroundOpacity`）+ 1px 描边 + 顶部标题栏（容器标题）；
+ * 主面板的标题栏里还有负重条与负重文本，「整理」按钮在主面板右下角。
+ * 同一容器的多块子网格在面板里并排，各自上方有小标题（如 `弹挂 part2 (1x2)`）。
  *
- * 刷新：`Refresh()` 是幂等的全量刷新（负重条 + 标题 + 每块子网格），
+ * 自适应：按 `DesiredCellSize` 拼出来的整屏超过 viewport 的 `MaxScreenFraction`（默认 0.85）时
+ * **等比缩小单格边长**（下限 `MinCellSize`，默认 24），`Origin` 则作为居中后的额外偏移。
+ * 分辨率变化后在 `Refresh()` 里按当前 viewport 尺寸重算，所以定时刷新与事件驱动刷新都会跟上。
+ * 关掉 `bCenterOnViewport` = **完全退回旧行为**：`Origin` 左上角起点 + 手动 `CellSize` + 每容器一行。
+ *
+ * 字体：容器标题 = `CellSize * 0.4`（下限 14），堆叠角标 / tooltip / 负重文本 / 小标题 = 基准字号 × `CellSize / 64`
+ * （见 `ScaledFontSize`），都不写死像素字号。
+ *
+ * 刷新：`Refresh()` 是幂等的全量刷新（负重条 + 标题 + 每块子网格 + 布局），
  * 定时器按 `RefreshIntervalSeconds`（`<= 0` = 关掉定时，只留事件驱动）重复调它；
  * 子格子落位成功、点了「整理」之后也会自动调（事件驱动）。
  *
@@ -103,6 +182,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FInvOperationFailedEvent, int32, Co
  * 三个可选音效（`PickUpSound` / `DropSound` / `ErrorSound`）**默认全空 = 静音**，不依赖任何音频资产。
  *
  * 组件没绑定 / 没就绪时：文本显示「未绑定」/ 空数据，打中文警告，不崩。
+ * 无头命令集 / 专用服务器里拿不到 viewport 尺寸（没有 Slate 应用）：跳过 Slate 那一步、不居中，
+ * 布局退回 `CellSize` 的确定性口径（`Origin` 起摆），数据与节点照常可用。
  */
 UCLASS(BlueprintType, meta = (DisplayName = "背包界面控件"))
 class UE_PACKAGE_SYSTEM_API UInvInventoryScreenWidget : public UUserWidget
@@ -118,9 +199,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
     TObjectPtr<UInvInventoryComponent> Inventory = nullptr;
 
-    /** 单格边长（像素），透传给子格子。 */
+    /**
+     * 单格边长（像素）。**手动模式 / 兼容模式**（`bCenterOnViewport = false`）用它；
+     * 居中模式下期望值看 `DesiredCellSize`，实际生效值看 `EffectiveCellSize`（可能被自适应缩小）。
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
-    float CellSize = 48.f;
+    float CellSize = 64.f;
 
     /** 要显示的根容器类型（顺序 = 从上到下的显示顺序）；`Nested` 会被忽略。 */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
@@ -131,9 +215,42 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
     float RefreshIntervalSeconds = 0.5f;
 
-    /** 界面左上角在屏幕上的位置（像素）；默认放在屏幕左上偏下的位置，避开左上角的调试文字。 */
+    /**
+     * 整屏左上角在屏幕上的位置（像素）。
+     *
+     * 居中模式（默认）下它是**居中之后的额外偏移**（默认 `(0,0)` = 正好居中）；
+     * 手动模式下它就是老的「左上角起点」语义。
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
-    FVector2D Origin = FVector2D(40.f, 140.f);
+    FVector2D Origin = FVector2D::ZeroVector;
+
+    /** 是否把整屏按 viewport 居中（默认开）。关掉 = 完全退回旧行为：`Origin` 左上角起点 + 手动 `CellSize`。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
+    bool bCenterOnViewport = true;
+
+    /** 居中模式期望的单格边长（像素）；整屏超出 `MaxScreenFraction` 时自动等比缩小。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
+    float DesiredCellSize = 64.f;
+
+    /** 整屏尺寸最多占 viewport 的比例（自适应缩放的触发线）；`<= 0` 按 0.85。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
+    float MaxScreenFraction = 0.85f;
+
+    /** 自适应缩小的下限（像素）：缩到这里就不再缩（宁可溢出，也不把格子缩成看不清）；`<= 0` 按 24。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
+    float MinCellSize = 24.f;
+
+    /** 容器面板之间的间距（像素），同时作为整屏四周的留白。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
+    FVector2D PanelSpacing = FVector2D(24.f, 18.f);
+
+    /** 面板底板的不透明度（0~1，默认 0.85）；压低它能让背后的游戏画面更清楚。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
+    float BackgroundOpacity = 0.85f;
+
+    /** 面板标题栏高度（像素，随单格边长缩放）；放不下负重条时会自动加高。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "背包界面", meta = (ExposeOnSpawn = "true"))
+    float TitleHeight = 40.f;
 
     /**
      * 拿起 / 放下 / 操作失败三个音效。**默认全空 = 全程静音**（零资产插件不要求配任何 Sound 资产）。
@@ -184,9 +301,45 @@ public:
     UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|状态")
     TObjectPtr<UButton> SortButton = nullptr;
 
-    /** 顶部说明文字。 */
+    /** 顶部说明文字（键盘提示：拖拽移动 / R 旋转 / Esc 取消）。 */
     UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|状态")
     TObjectPtr<UTextBlock> TitleLabel = nullptr;
+
+    /** 「整理」按钮里的文本（字号随单格边长缩放）。 */
+    UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|状态")
+    TObjectPtr<UTextBlock> SortButtonLabel = nullptr;
+
+    // ==================== 布局状态（只读） ====================
+
+    /** 最近一次布局**实际生效**的单格边长（自适应缩放后的值）；还没布局过时为 `0`。 */
+    UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|布局状态")
+    float EffectiveCellSize = 0.f;
+
+    /**
+     * 最近一次算出来的整屏布局。
+     *
+     * 居中模式：`PanelOrigin` / `TotalSize` / `CellSize` 三个值都有效；
+     * 手动模式（`bCenterOnViewport = false`）或拿不到 viewport 尺寸时：只填 `CellSize` 与 `PanelOrigin`，
+     * `TotalSize` 保持 `(0,0)`（那种路径没有「整屏尺寸」这个概念）。
+     */
+    UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|布局状态")
+    FInvScreenLayout ScreenLayout;
+
+    /** 每块容器面板的底板；下标 = `PanelContainers`，**下标 0 恒为主面板（背包）**。 */
+    UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|布局状态")
+    TArray<TObjectPtr<UImage>> PanelBoards;
+
+    /** 每块容器面板的标题栏底条（与 `PanelBoards` 同下标）。 */
+    UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|布局状态")
+    TArray<TObjectPtr<UImage>> PanelTitleBars;
+
+    /** 每块容器面板的标题文本（与 `PanelBoards` 同下标，字号 = `CellSize * 0.4` 且 ≥ 14）。 */
+    UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|布局状态")
+    TArray<TObjectPtr<UTextBlock>> PanelTitles;
+
+    /** 每块容器面板对应的容器句柄（与 `PanelBoards` 同下标；`0` = 那一块没面板）。 */
+    UPROPERTY(BlueprintReadOnly, Transient, Category = "背包界面|布局状态")
+    TArray<int64> PanelContainers;
 
     // ==================== 右键菜单状态 ====================
 
@@ -287,6 +440,56 @@ public:
     /** 换数据源（会强制重建子格子）。 */
     UFUNCTION(BlueprintCallable, Category = "背包界面", meta = (DisplayName = "Set Inventory"))
     void SetInventory(UInvInventoryComponent* InInventory);
+
+    // ==================== 布局（纯函数 / 查询） ====================
+
+    /**
+     * 屏幕布局纯函数：**不读实例状态**，按「参考内容 = 默认背包根容器（6×5 格）+ 面板四周留白 `PanelSpacing`」
+     * 解算整屏布局，供蓝图 / 测试直接断言，也是实例自适应缩放的同一套规则。
+     *
+     * 规则：
+     * - 单格边长先取 `InDesiredCellSize`，再被可用尺寸压住：`可用 = ViewportSize * max(InMaxScreenFraction, …)`，
+     *   每轴可用边长 = `(可用尺寸 - 两倍 InPanelSpacing) / 格数`，取两轴较小值；
+     * - 结果再夹到 `InMinCellSize`（**下限优先**：viewport 小到连下限都放不下时宁可溢出，也不给出 `<= 0` 的值）；
+     * - `TotalSize = 格数 × CellSize + 两倍 InPanelSpacing`，`PanelOrigin = (ViewportSize - TotalSize) / 2`
+     *   （所以 `PanelOrigin + TotalSize / 2` 恒等于 `ViewportSize / 2`，即整屏居中）。
+     *
+     * 参数兜底：`InDesiredCellSize <= 0` 按 `InMinCellSize` 处理；`InMinCellSize <= 0` 按 24；
+     * `InMaxScreenFraction <= 0` 按 0.85（`> 1` 夹到 1）；`InPanelSpacing` 的负分量按 0；`ViewportSize` 的负分量按 0。
+     *
+     * （参数名带 `In` 前缀不是随手起的：同名属性就在这个类上，UHT 不允许函数参数与类成员同名。）
+     */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Compute Screen Layout"))
+    static FInvScreenLayout ComputeScreenLayout(FVector2D ViewportSize, float InDesiredCellSize,
+        float InMaxScreenFraction, float InMinCellSize, FVector2D InPanelSpacing);
+
+    /**
+     * 字号缩放工具：`实际字号 = 基准字号 × 单格边长 / 64`，下限 10 像素。
+     * 基准字号统一按 64 像素的单格边长设计，所以同一份代码在 48 的单格边长下拿到的就是老字号（12）。
+     * `InCellSize <= 0` 时按基准边长算（等于原样返回基准字号）。
+     */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Scaled Font Size"))
+    static int32 ScaledFontSize(int32 BaseFontSize, float InCellSize);
+
+    /** 容器标题字号 = 单格边长 × 0.4（四舍五入），下限 14。`InCellSize <= 0` 时按基准边长 64 算（= 26）。 */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Title Font Size"))
+    static int32 TitleFontSize(float InCellSize);
+
+    /** 最近一次布局**实际生效**的单格边长（自适应缩放后的值）；还没布局过时为 `0`。 */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Effective Cell Size"))
+    float GetEffectiveCellSize() const { return EffectiveCellSize; }
+
+    /** 最近一次算出来的整屏布局（见 `ScreenLayout` 的说明）。 */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Screen Layout"))
+    FInvScreenLayout GetScreenLayout() const { return ScreenLayout; }
+
+    /** 每块容器面板的底板（下标 = `Get Panel Containers`，下标 0 = 主面板）。 */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Panel Boards"))
+    TArray<UImage*> GetPanelBoards() const;
+
+    /** 每块容器面板对应的容器句柄（与 `Get Panel Boards` 同下标；`0` = 那一块没面板）。 */
+    UFUNCTION(BlueprintPure, Category = "背包界面", meta = (DisplayName = "Get Panel Containers"))
+    TArray<int64> GetPanelContainers() const;
 
     /**
      * 强制走一遍 Slate 构造（取 Slate 控件 → 跑构造回调 → 建子控件 → 拉数据），
@@ -464,9 +667,15 @@ protected:
     /** 定时刷新的下限（秒），免得配置成 0 之外的极小值把定时器退化成逐帧。 */
     static constexpr float MinRefreshInterval = 0.05f;
 
-    /** 子控件的默认字号（像素）。 */
-    static constexpr int32 TitleFontSize = 14;
-    static constexpr int32 LabelFontSize = 12;
+    /**
+     * 子控件**基准**字号（像素）：按 64 像素的单格边长设计，实际字号 = `ScaledFontSize(基准, 单格边长)`。
+     * 基准放这里而不是写死在调用处，是为了「字号随格子缩放」只有一套口径。
+     * （面板标题另有一套：`TitleFontSize` = 单格边长 × 0.4、下限 14，比正文更醒目。）
+     */
+    static constexpr int32 LabelFontBase = 16;
+
+    /** 面板底板的圆角半径基准（像素，按单格边长缩放）。 */
+    static constexpr float PanelCornerRadiusBase = 10.f;
 
 private:
     /** 已经建过的「容器 + 子网格」对（与 `GridWidgets` 同下标）：容器拓扑变了才补 / 隐藏格子。 */
@@ -503,8 +712,8 @@ private:
      */
     void EnsureContentBuilt();
 
-    /** 把子控件放进画布（位置 + 尺寸都写死，自动布局只有这一处）。 */
-    void PlaceInCanvas(UWidget* Widget, const FVector2D& Position, const FVector2D& Size);
+    /** 把子控件放进画布（位置 + 尺寸 + 画布层级都写死，自动布局只有这一处）。 */
+    void PlaceInCanvas(UWidget* Widget, const FVector2D& Position, const FVector2D& Size, int32 ZOrder = 0);
 
     /** 按 `ShowTypes` 收集「应有的格子」（容器 + 子网格下标，顺序确定）。 */
     void CollectDesiredGrids(TArray<FInvGridSlotKey>& OutGrids) const;
@@ -515,8 +724,76 @@ private:
     /** 建一块子格子（含它的小标题），并挂进画布；`OutCaption` 回传标题控件（可能为空）。 */
     UInvGridWidget* CreateGridWidget(int64 InContainer, int32 InPart, int32 AtIndex, UTextBlock*& OutCaption);
 
-    /** 按当前格子尺寸重排：同容器多块并排一行，容器之间换行。 */
+    /** 按当前格子尺寸重排：同容器多块并排一行，容器之间换行（**手动模式的旧口径**）。 */
     void LayoutGrids();
+
+    // ==================== 布局（居中 / 自适应） ====================
+
+    /**
+     * 算这次布局要用的单格边长，写进 `EffectiveCellSize`：
+     *
+     * - 手动模式（`bCenterOnViewport = false`）→ `CellSize`（`<= 0` 时退回 `DesiredCellSize`）；
+     * - 居中模式但**拿不到 viewport 尺寸**（没上屏 / 无头命令集 / 专用服务器）→ 同上，保持确定性；
+     * - 居中模式且尺寸已知 → 按实测「固定部分 + 每格尺寸」解算：`min(DesiredCellSize, 可用/内容)`，
+     *   夹到 `MinCellSize`，再用实测兜一遍取整误差（超了就按比例再缩，最多 3 轮）。
+     */
+    void UpdateEffectiveCellSize();
+
+    /** 布局总入口：居中模式走 `LayoutCentered`，手动模式走旧口径。 */
+    void ApplyLayout();
+
+    /** 居中模式：面板簇居中 + 背景板 / 标题栏 / 负重条 / 「整理」按钮 + 子格子落位。 */
+    void LayoutCentered();
+
+    /** 手动模式（兼容）：`Origin` 左上角起点、每个容器一行、`CellSize` 原样，不画面板。 */
+    void LayoutManual();
+
+    /**
+     * 解算每块容器面板的尺寸与相对位置（簇坐标，主面板中心在原点）。
+     *
+     * `InCellSize` 传 1 与 0 两次就能分离「不随格子缩放的固定部分」与「每个格子的尺寸」——
+     * 自适应缩放靠这两档实测，不靠拼常数。
+     */
+    void BuildPanelRects(float InCellSize, TArray<FInvScreenPanelRect>& OutPanels) const;
+
+    /** 面板簇尺寸（不含 `PanelSpacing` 留白）：把 `BuildPanelRects` 的结果按主面板中心对称展开。 */
+    FVector2D MeasureClusterSize(float InCellSize) const;
+
+    /** 保证面板装饰（底板 / 标题栏 / 标题文本）至少 `Needed` 块，多余的收起来（控件复用，不销毁）。 */
+    void SyncPanelDecor(int32 Needed);
+
+    /** 字号按单格边长重新应用（提示 / 负重文本 / 按钮 / 菜单 / 面板标题 / 子格子小标题）。 */
+    void ApplyFonts(float InCellSize);
+
+    /** 面板装饰的可见性（没有面板时全部收起）。 */
+    void SetPanelDecorVisible(bool bVisible);
+
+    /**
+     * 把标题提示 / 负重条 / 负重文本 / 「整理」按钮按 `Origin` 摆好（**旧口径**）：
+     * 手动模式与「一块面板都没有」时用它。
+     */
+    void LayoutHeaderAtOrigin(float InCellSize);
+
+    /** viewport 尺寸（Slate 单位）：本控件几何优先，其次游戏 viewport；拿不到返回 `(0,0)` = 尺寸未知。 */
+    FVector2D ResolveViewportSize() const;
+
+    /** 手动模式 / 尺寸未知时用的单格边长：`CellSize`，非法时退回 `DesiredCellSize`。 */
+    float ManualCellSize() const;
+
+    /** 字号缩放用的单格边长：`EffectiveCellSize`，还没布局过时退回 `ManualCellSize()`。 */
+    float FontCellSize() const;
+
+    /** 生效的面板间距（负分量按 0）。 */
+    FVector2D EffectivePanelSpacing() const;
+
+    /** 生效的整屏占比上限（`<= 0` 按 0.85，`> 1` 夹到 1）。 */
+    float EffectiveMaxScreenFraction() const;
+
+    /** 生效的自适应下限（`<= 0` 按 24）。 */
+    float EffectiveMinCellSize() const;
+
+    /** 某个容器在 `GridWidgets` 里的子格子（按 `Container` 过滤，按下标升序）。 */
+    void CollectGridsOfContainer(int64 InContainer, TArray<UInvGridWidget*>& OutGrids) const;
 
     /** 负重条与文本的刷新。 */
     void UpdateWeightDisplay();

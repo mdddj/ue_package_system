@@ -441,6 +441,15 @@ C++ 侧（不走蓝图）：`Fue_package_systemFfi` 已含全部 33 个函数指
 失败时零副作用返回错误码；「使用」只广播事件（玩法效果由游戏侧实现）；「删除」走 `DestroyItem`。
 所有失败都会经 `OnOperationFailed` 带错误码与中文文本。
 
+**布局（居中 / 自适应）**：默认 `bCenterOnViewport = true` —— 整屏相对 viewport 水平垂直居中，
+**背包为主面板居中**，弹挂 / 安全箱 / 口袋排到左 / 右 / 下方；`DesiredCellSize = 64` 为期望格子边长，
+超过 `MaxScreenFraction = 0.85` 时自动等比缩小（下限 `MinCellSize = 24`）；`Origin` 语义变为
+「居中后的额外偏移」。纯函数 `Compute Screen Layout(ViewportSize, DesiredCellSize, MaxScreenFraction,
+MinCellSize, PanelSpacing) -> FInvScreenLayout{CellSize, TotalSize, PanelOrigin}` 可在蓝图/测试里直接算；
+字号工具 `ScaledFontSize(Base, CellSize)` / `TitleFontSize(CellSize)`；查询
+`Get Effective Cell Size` / `Get Screen Layout` / `Get Panel Boards` / `Get Panel Containers`。
+关掉 `bCenterOnViewport` = 完全退回旧行为（`Origin` 左上角起点 + 手动 `CellSize`）。
+
 ## 9. 性能指标与验收
 
 | 指标 | 目标 | 说明 |

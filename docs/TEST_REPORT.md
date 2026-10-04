@@ -169,8 +169,8 @@ UE 侧速度/体力曲线（核心只给 ratio）；C++ 蓝图包装（目前插
   `UInvItemDefinition`（图标 / 名称 / 数值，可子类化）、实例操作交给
   `UInvInventoryComponent`、UI 读取交给 `FInvItemView`。
 - **无头行为验证**（在真实 UE 5.8 编辑器命令行里跑，不是单元测试）：
-  `./tools/ue_headless/run.sh` → **六套共 475 项检查全部通过**
-  （友好层 84 + 套包展开 9 + 演示 Actor 46 + 内容管线 59 + UMG 界面 111 + 界面交互 166；覆盖初始化幂等、
+  `./tools/ue_headless/run.sh` → **六套共 517 项检查全部通过**
+  （友好层 84 + 套包展开 9 + 演示 Actor 46 + 内容管线 59 + UMG 界面 153 + 界面交互 166；覆盖初始化幂等、
   DefId 顺序与数组顺序无关、落位 / 移动 / 旋转 / 越界零副作用、套包嵌套与顶层过滤、
   套包展开（`FInvItemView.OwnContainer` 直连内部容器）、负重与超重、存读档往返、
   目录不匹配被拒、未就绪与野句柄错误路径、字段夹取与运行时补注册、演示摘要内容与幂等、
@@ -211,6 +211,15 @@ UE 侧速度/体力曲线（核心只给 ratio）；C++ 蓝图包装（目前插
   落点「当前 part → 同容器其它 part」，失败返回 `18` 且零变化。
   **166 项无头检查**覆盖 `FindFreeCell` 边界（空/碎片/旋转/满/越界）、`TryAutoPlace`、菜单过滤与
   执行、`Ctrl+点击`、`Delete`、音效留空不崩与失败事件上报；既有五套零回归。
+- **界面布局优化（居中 / 放大 / 自适应）**：`UInvInventoryScreenWidget` 新增
+  `FInvScreenLayout` / `Compute Screen Layout` 纯函数、`ScaledFontSize` / `TitleFontSize` 字号工具、
+  7 个布局属性（`bCenterOnViewport` 默认开、`DesiredCellSize = 64`、`MaxScreenFraction = 0.85`、
+  `MinCellSize = 24`、`PanelSpacing`、`BackgroundOpacity`、`TitleHeight`）；背包为主面板居中，
+  弹挂 / 安全箱 / 口袋按存在情况排到左 / 右 / 下；每容器半透明深色圆角底板（`FSlateRoundedBoxBrush`，
+  零资产）+ 标题栏 + 「整理」按钮右下角；字号全部按格子边长缩放；超屏自动等比缩小，分辨率变化后重算。
+  `CellSize` 默认 48 → 64，`Origin` 语义改为“居中后的额外偏移”（关闭居中开关即完全退回旧行为）。
+  `inv_ui_test.py` 新增 42 项断言（111 → 153）：1920×1080 居中误差 ≤ 1px、640×360 自动缩小且不超 85%、
+  非法期望尺寸仍为正、默认值、面板排布与底板 ZOrder、按钮随格子缩放、兼容模式退回 `Origin` 语义。
 
 ## 8. 复现命令
 
@@ -228,7 +237,7 @@ cd ../.. && uerust build .                     # 重新构建并把 dylib 拷到
 
 ./tools/ffi_smoke/run.sh                       # FFI 冒烟（不依赖 UE，验证导出符号与 C ABI）
 
-./tools/ue_headless/run.sh                     # 无头 UE 行为验证（六套共 475 项；需要 UE 5.8）
+./tools/ue_headless/run.sh                     # 无头 UE 行为验证（六套共 517 项；需要 UE 5.8）
 
 # UE 5.8 编译（macOS）
 "/Users/Shared/Epic Games/UE_5.8/Engine/Build/BatchFiles/Mac/Build.sh" \

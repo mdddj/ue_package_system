@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "rider": {
+      "type": "http",
+      "url": "http://127.0.0.1:64482/stream",
+      "headers": {
+        "IJ_MCP_SERVER_PROJECT_PATH": "/Users/ldd/Documents/UEPROJ/gamedemo"
+      }
+    }
+  }
+}

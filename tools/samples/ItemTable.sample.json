@@ -1,0 +1,97 @@
+[
+	{
+		"Name": "AK_Mag",
+		"DisplayName": "AK 弹匣",
+		"Description": "7.62x39 30 发弹匣。可旋转，弹挂里横着塞。",
+		"Icon": "/Game/BackpackDemo/Icons/T_AK_Mag.T_AK_Mag",
+		"Width": 1,
+		"Height": 2,
+		"bRotatable": true,
+		"MaxStack": 1,
+		"Weight": 0.2,
+		"Value": 120,
+		"TagBits": 1,
+		"ForbiddenContainerTypes": 0,
+		"ContainerParts": []
+	},
+	{
+		"Name": "Ammo_762",
+		"DisplayName": "7.62x39 弹药",
+		"Description": "散装弹药，60 发一堆。",
+		"Icon": "/Game/BackpackDemo/Icons/T_Ammo.T_Ammo",
+		"Width": 1,
+		"Height": 1,
+		"bRotatable": false,
+		"MaxStack": 60,
+		"Weight": 0.012,
+		"Value": 3,
+		"TagBits": 2,
+		"ForbiddenContainerTypes": 0,
+		"ContainerParts": []
+	},
+	{
+		"Name": "Bandage",
+		"DisplayName": "绷带",
+		"Description": "止血用，不许塞进安全箱。",
+		"Icon": "/Game/BackpackDemo/Icons/T_Bandage.T_Bandage",
+		"Width": 1,
+		"Height": 1,
+		"bRotatable": false,
+		"MaxStack": 1,
+		"Weight": 0.05,
+		"Value": 30,
+		"TagBits": 4,
+		"ForbiddenContainerTypes": 4,
+		"ContainerParts": []
+	},
+	{
+		"Name": "Grenade_F1",
+		"DisplayName": "F1 手雷",
+		"Description": "防御型手雷，不可堆叠，不许塞口袋。",
+		"Icon": "/Game/BackpackDemo/Icons/T_Grenade.T_Grenade",
+		"Width": 1,
+		"Height": 1,
+		"bRotatable": false,
+		"MaxStack": 1,
+		"Weight": 0.6,
+		"Value": 200,
+		"TagBits": 8,
+		"ForbiddenContainerTypes": 1,
+		"ContainerParts": []
+	},
+	{
+		"Name": "Medkit_IFAK",
+		"DisplayName": "IFAK 急救包",
+		"Description": "2x2 的急救包，单个不可堆叠，可旋转。",
+		"Icon": "/Game/BackpackDemo/Icons/T_Medkit.T_Medkit",
+		"Width": 2,
+		"Height": 2,
+		"bRotatable": true,
+		"MaxStack": 1,
+		"Weight": 0.5,
+		"Value": 300,
+		"TagBits": 4,
+		"ForbiddenContainerTypes": 0,
+		"ContainerParts": []
+	},
+	{
+		"Name": "Backpack_Assault",
+		"DisplayName": "突击背包",
+		"Description": "6x5 的套包。带容器规格的物品必须 MaxStack = 1。",
+		"Icon": "/Game/BackpackDemo/Icons/T_Backpack.T_Backpack",
+		"Width": 3,
+		"Height": 3,
+		"bRotatable": false,
+		"MaxStack": 1,
+		"Weight": 2.0,
+		"Value": 900,
+		"TagBits": 256,
+		"ForbiddenContainerTypes": 1,
+		"ContainerParts": [
+			{
+				"X": 6,
+				"Y": 5
+			}
+		]
+	}
+]

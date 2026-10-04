@@ -1,0 +1,11 @@
+Binaries/
+Intermediate/
+Saved/
+Source/*-dylib/target/
+*.xcworkspace
+*.xcuserdata/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+tools/ue_headless/*.txt

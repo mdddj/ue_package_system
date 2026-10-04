@@ -1,0 +1,24 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "ue_package_system",
+    "Description":"战术网格背包系统（Rust 核心 + UE 桥接）",
+    "Category": "Other",
+    "CreatedBy": "",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "SupportURL": "",
+    "CanContainContent": true,
+    "IsBetaVersion": false,
+    "IsExperimentalVersion": false,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "ue_package_system",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        }
+    ]
+}

@@ -1,0 +1,33 @@
+[package]
+name = "ue_package_system-dylib"
+version = "0.2.0"
+edition = "2021"
+description = "战术网格背包系统核心（Rust）+ UE5 C ABI 桥接"
+
+[lib]
+# cdylib：跨语言 ABI 边界，UE 侧 dlopen 加载（不是给 Rust 之间链接用的 dylib）。
+# rlib：让 tests/ 与 benches/ 能链接这个 crate —— 只有 cdylib 时集成测试编不过。
+# 产物：libue_package_system_dylib.dylib / ue_package_system_dylib.dll
+name = "ue_package_system_dylib"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+slotmap = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1.0"
+criterion = "0.5"
+
+[[bench]]
+name = "can_place"
+harness = false
+
+[build-dependencies]
+cbindgen = "0.27.0"
+
+[profile.release]
+opt-level = 3
+lto = true
